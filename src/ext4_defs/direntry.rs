@@ -169,7 +169,7 @@ impl Ext4DirEntry {
         len
     }
 
-    pub fn write_entry(&mut self, entry_len: u16, inode: u32, name: &str, de_type:DirEntryType) {
+    pub fn write_entry(&mut self, entry_len: u16, inode: u32, name: &str, de_type:&DirEntryType) {
         self.inode = inode;
         self.entry_len = entry_len;
         self.name_len = name.len() as u8;

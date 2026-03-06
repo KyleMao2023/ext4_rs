@@ -68,6 +68,12 @@ impl Ext4 {
     pub fn create(&self, parent: u32, name: &str, inode_mode: u16) -> Result<Ext4InodeRef> {
         let mut parent_inode_ref = self.get_inode_ref(parent);
 
+        // Duplicate name is not allowed
+        let mut search_result = Ext4DirSearchResult::new(Ext4DirEntry::default());
+        if self.dir_find_entry(parent, name, &mut search_result).is_ok() {
+            return Err(Ext4Error::new(Errno::EEXIST));
+        }
+
         // let mut child_inode_ref = self.create_inode(inode_mode)?;
         let init_child_ref = self.create_inode(inode_mode)?;
 
