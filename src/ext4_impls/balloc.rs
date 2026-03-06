@@ -159,7 +159,8 @@ impl Ext4 {
             bgid = self.get_bgid_of_block(goal);
             idx_in_bg = self.addr_to_idx_bg(goal);
         } else {
-            bgid = 1;
+            // bgid = 1;
+            bgid = 0;
             idx_in_bg = 0;
         }
 
