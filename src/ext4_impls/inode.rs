@@ -417,10 +417,15 @@ impl Ext4 {
     }
 
     /// Get the last extent in the extent tree
-    fn get_last_extent(&self, inode_ref: &Ext4InodeRef) -> Result<Ext4Extent> {
+    fn get_last_extent(&self, inode_ref: &mut Ext4InodeRef) -> Result<Ext4Extent> {
         let root_header = inode_ref.inode.root_extent_header();
         if root_header.entries_count == 0 {
             return return_errno_with_message!(Errno::ENOENT, "No extents found");
+        }
+
+        if root_header.depth == 0 {
+            let pos = root_header.entries_count as usize - 1;
+            return Ok(inode_ref.inode.root_extent_at(pos));
         }
 
         let mut current_header = root_header;
@@ -455,6 +460,8 @@ impl Ext4 {
             &extent_block.data[EXT4_EXTENT_HEADER_SIZE
                 + (extent_header.entries_count - 1) as usize * EXT4_EXTENT_SIZE..],
         );
+
+        log::debug!("last_extent: first_block = {}, block_count = {}", last_extent.first_block, last_extent.block_count);
 
         Ok(last_extent)
     }
