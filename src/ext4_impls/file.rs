@@ -550,11 +550,11 @@ impl Ext4 {
     pub fn truncate_inode(&self, inode_ref: &mut Ext4InodeRef, new_size: u64) -> Result<usize> {
         let old_size = inode_ref.inode.size();
 
-        assert!(old_size > new_size);
-
         if old_size == new_size {
             return Ok(EOK);
         }
+
+        assert!(old_size > new_size);
 
         let block_size = BLOCK_SIZE as u64;
         let new_blocks_cnt = ((new_size + block_size - 1) / block_size) as u32;
