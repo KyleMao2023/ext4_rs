@@ -29,11 +29,7 @@ impl Ext4 {
 
         // If this is the first link. add '.' and '..' entries
         if child.inode.is_dir() {
-            // let child_ref = child.clone();
-            let new_child_ref = Ext4InodeRef {
-                inode_num: child.inode_num,
-                inode: child.inode,
-            };
+            let new_child_ref = child.clone();
 
             // at this point child need a new block
             // Create "." entry pointing to the child directory itself
@@ -75,9 +71,9 @@ impl Ext4 {
         }
 
         // let mut child_inode_ref = self.create_inode(inode_mode)?;
-        let init_child_ref = self.create_inode(inode_mode)?;
+        let mut init_child_ref = self.create_inode(inode_mode)?;
 
-        self.write_back_inode_without_csum(&init_child_ref);
+        self.write_back_inode_without_csum(&mut init_child_ref);
         // load new
         let mut child_inode_ref = self.get_inode_ref(init_child_ref.inode_num);
 
@@ -121,6 +117,7 @@ impl Ext4 {
         let inode_ref = Ext4InodeRef {
             inode_num,
             inode,
+            raw_inode: vec![0; self.super_block.inode_size() as usize],
         };
 
         Ok(inode_ref)
@@ -146,7 +143,7 @@ impl Ext4 {
         init_child_ref.inode.set_uid(uid);
         init_child_ref.inode.set_gid(gid);
 
-        self.write_back_inode_without_csum(&init_child_ref);
+        self.write_back_inode_without_csum(&mut init_child_ref);
         // load new
         let mut child_inode_ref = self.get_inode_ref(init_child_ref.inode_num);
 

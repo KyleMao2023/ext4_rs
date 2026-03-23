@@ -5,6 +5,12 @@ use crate::utils::*;
 use crate::ext4_defs::*;
 
 impl Ext4 {
+    /// 从磁盘重新读取超级块，避免动态计数字段使用挂载时快照。
+    pub fn read_super_block_from_disk(&self) -> Ext4Superblock {
+        let block = Block::load(&self.block_device, SUPERBLOCK_OFFSET);
+        block.read_as()
+    }
+
     /// 获取system zone缓存
     pub fn get_system_zone(&self) -> Vec<SystemZone> {
         let mut zones = Vec::new();

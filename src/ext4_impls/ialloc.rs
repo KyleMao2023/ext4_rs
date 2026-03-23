@@ -5,16 +5,10 @@ use crate::utils::bitmap::*;
 
 impl Ext4 {
     pub fn ialloc_alloc_inode(&self, is_dir: bool) -> Result<u32> {
-        let mut bgid = 0;
         let bg_count = self.super_block.block_group_count();
-        let mut super_block = self.super_block;
+        let mut super_block = self.read_super_block_from_disk();
 
-        while bgid <= bg_count {
-            if bgid == bg_count {
-                bgid = 0;
-                continue;
-            }
-
+        for bgid in 0..bg_count {
             let mut bg =
                 Ext4BlockGroup::load_new(&self.block_device, &super_block, bgid as usize);
 
@@ -72,8 +66,6 @@ impl Ext4 {
 
                 return Ok(inode_num);
             }
-
-            bgid += 1;
         }
 
         return_errno_with_message!(Errno::ENOSPC, "alloc inode fail");
@@ -83,7 +75,7 @@ impl Ext4 {
         // Compute index of block group
         let bgid = self.get_bgid_of_inode(index);
 
-        let mut super_block = self.super_block;
+        let mut super_block = self.read_super_block_from_disk();
         let mut bg =
             Ext4BlockGroup::load_new(&self.block_device, &super_block, bgid as usize);
 
@@ -105,17 +97,17 @@ impl Ext4 {
 
         // Update free inodes count in block group
         let free_inodes = bg.get_free_inodes_count() + 1;
-        bg.set_free_inodes_count(&self.super_block, free_inodes);
+        bg.set_free_inodes_count(&super_block, free_inodes);
 
         // If inode was a directory, decrement the used directories count
         if is_dir {
-            let used_dirs = bg.get_used_dirs_count(&self.super_block) - 1;
-            bg.set_used_dirs_count(&self.super_block, used_dirs);
+            let used_dirs = bg.get_used_dirs_count(&super_block) - 1;
+            bg.set_used_dirs_count(&super_block, used_dirs);
         }
 
         bg.sync_to_disk_with_csum(&self.block_device, bgid as usize, &super_block);
 
-        super_block.decrease_free_inodes_count();
+        super_block.increase_free_inodes_count();
         super_block.sync_to_disk_with_csum(&self.block_device);
     }
 }
