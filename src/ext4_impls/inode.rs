@@ -83,18 +83,37 @@ impl Ext4 {
     /// Returns:
     /// `Result<Ext4Fsblk>` - physical block id
     pub fn get_pblock_idx(&self, inode_ref: &Ext4InodeRef, lblock: Ext4Lblk) -> Result<Ext4Fsblk> {
-        let search_path = self.find_extent(inode_ref, lblock);
-        if let Ok(path) = search_path {
-            // get the last path
-            let path = path.path.last().unwrap();
+        let path = self.find_extent(inode_ref, lblock)?;
+        let last = match path.path.last() {
+            Some(last) => last,
+            None => {
+                return_errno_with_message!(Errno::EIO, "search extent returned empty path");
+            }
+        };
 
-            // get physical block id
-            let fblock = path.pblock;
+        let extent = match last.extent {
+            Some(extent) => extent,
+            None => {
+                return_errno_with_message!(Errno::ENOENT, "logical block is not mapped by any extent");
+            }
+        };
 
-            return Ok(fblock);
+        let first = extent.get_first_block();
+        let len = extent.get_actual_len() as u32;
+        if len == 0 {
+            return_errno_with_message!(Errno::EIO, "extent has zero length");
         }
 
-        return_errno_with_message!(Errno::EIO, "search extent fail");
+        if lblock < first || lblock >= first + len {
+            return_errno_with_message!(Errno::EIO, "logical block is outside extent range");
+        }
+
+        let fblock = lblock as u64 - first as u64 + extent.get_pblock();
+        if fblock == 0 {
+            return_errno_with_message!(Errno::EIO, "invalid physical block 0 from extent mapping");
+        }
+
+        Ok(fblock)
     }
 
     /// Allocate a new block

@@ -62,6 +62,15 @@ impl Ext4 {
         let block = Block::load(&block_device, SUPERBLOCK_OFFSET);
         let super_block: Ext4Superblock = block.read_as();
 
+        if !super_block.is_valid_basic() {
+            panic!(
+                "Invalid ext4 superblock: magic={:#x}, blocks_per_group={}, inodes_per_group={} (possible metadata corruption)",
+                super_block.magic(),
+                super_block.blocks_per_group(),
+                super_block.inodes_per_group()
+            );
+        }
+
         // drop(block);
         
         let ext4_tmp = Ext4 {

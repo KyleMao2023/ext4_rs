@@ -8,6 +8,7 @@ const EXT4_SB_FREE_BLOCKS_COUNT_LO_OFFSET: usize = 0x0c;
 const EXT4_SB_FREE_INODES_COUNT_OFFSET: usize = 0x10;
 const EXT4_SB_FREE_BLOCKS_COUNT_HI_OFFSET: usize = 0x158;
 const EXT4_SB_CHECKSUM_OFFSET: usize = 0x3fc;
+const EXT4_SUPER_MAGIC: u16 = 0xEF53;
 
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +113,15 @@ pub struct Ext4Superblock {
 }
 
 impl Ext4Superblock {
+    /// Basic sanity validation for mount-time checks.
+    pub fn is_valid_basic(&self) -> bool {
+        self.magic == EXT4_SUPER_MAGIC && self.blocks_per_group != 0 && self.inodes_per_group != 0
+    }
+
+    pub fn magic(&self) -> u16 {
+        self.magic
+    }
+
     /// Returns the size of inode structure.
     pub fn inode_size(&self) -> u16 {
         self.inode_size
@@ -159,10 +169,13 @@ impl Ext4Superblock {
 
     /// Returns the number of block groups.
     pub fn block_group_count(&self) -> u32 {
+        if self.blocks_per_group == 0 {
+            panic!("Invalid ext4 superblock: blocks_per_group=0 (possible superblock corruption)");
+        }
+
         let blocks_count = (self.blocks_count_hi as u64) << 32 | self.blocks_count_lo as u64;
 
         let blocks_per_group = self.blocks_per_group as u64;
-
         let mut block_group_count = blocks_count / blocks_per_group;
 
         if (blocks_count % blocks_per_group) != 0 {
