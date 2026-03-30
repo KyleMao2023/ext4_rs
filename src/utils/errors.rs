@@ -33,6 +33,7 @@ pub enum Errno {
     EROFS = 30,        /* Read-only file system */
     EMLINK = 31,       /* Too many links */
     EPIPE = 32,        /* Broken pipe */
+    ENOTEMPTY = 39,    /* Directory not empty */
     ENAMETOOLONG = 36, /* File name too long */
     ENOTSUP   = 95,   /* Not supported */
 }

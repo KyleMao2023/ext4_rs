@@ -456,6 +456,148 @@ impl Ext4 {
 
         Ok(EOK)
     }
+
+    fn dir_update_dotdot(&self, dir_inode: u32, new_parent_inode: u32) -> Result<usize> {
+        let dir_ref = self.get_inode_ref(dir_inode);
+        let mut result = Ext4DirSearchResult::new(Ext4DirEntry::default());
+        self.dir_find_entry(dir_inode, "..", &mut result)?;
+
+        let mut ext4block = Block::load(&self.block_device, result.pblock_id * BLOCK_SIZE);
+        let dotdot: &mut Ext4DirEntry = ext4block.read_offset_as_mut(result.offset);
+        dotdot.inode = new_parent_inode;
+        self.dir_set_csum(&mut ext4block, dir_ref.inode.generation());
+        ext4block.sync_blk_to_disk(&self.block_device);
+        Ok(EOK)
+    }
+
+    fn dir_remove_target(
+        &self,
+        parent: &mut Ext4InodeRef,
+        target: &mut Ext4InodeRef,
+        name: &str,
+    ) -> Result<usize> {
+        if target.inode.is_dir() {
+            if self.dir_has_entry(target.inode_num) {
+                return_errno_with_message!(Errno::ENOTEMPTY, "target directory is not empty");
+            }
+            self.truncate_inode(target, 0)?;
+            self.dir_remove_entry(parent, name)?;
+            parent
+                .inode
+                .set_links_count(parent.inode.links_count().saturating_sub(1));
+            self.ialloc_free_inode(target.inode_num, true);
+            return Ok(EOK);
+        }
+
+        self.dir_remove_entry(parent, name)?;
+        if target.inode.links_count() > 1 {
+            target
+                .inode
+                .set_links_count(target.inode.links_count() - 1);
+            self.write_back_inode(target);
+        } else {
+            self.truncate_inode(target, 0)?;
+            self.ialloc_free_inode(target.inode_num, false);
+        }
+
+        Ok(EOK)
+    }
+
+    /// Move an existing directory entry to a new parent/name.
+    ///
+    /// If the destination exists, it is replaced atomically under the same FS
+    /// lock. This updates directory link counts and the moved directory's `..`
+    /// entry when moving a directory across parents.
+    pub fn rename_entry(
+        &self,
+        old_parent_inode: u32,
+        old_name: &str,
+        new_parent_inode: u32,
+        new_name: &str,
+    ) -> Result<usize> {
+        let mut search_result = Ext4DirSearchResult::new(Ext4DirEntry::default());
+        self.dir_find_entry(old_parent_inode, old_name, &mut search_result)?;
+
+        let child_ino = search_result.dentry.inode;
+        let child = self.get_inode_ref(child_ino);
+
+        let mut target_result = Ext4DirSearchResult::new(Ext4DirEntry::default());
+        let target_entry = self
+            .dir_find_entry(new_parent_inode, new_name, &mut target_result)
+            .ok()
+            .map(|_| target_result.dentry);
+
+        if let Some(target_entry) = target_entry {
+            if target_entry.inode == child_ino {
+                return Ok(EOK);
+            }
+
+            let mut target = self.get_inode_ref(target_entry.inode);
+            if child.inode.is_dir() && !target.inode.is_dir() {
+                return_errno_with_message!(Errno::ENOTDIR, "cannot replace non-directory with directory");
+            }
+            if !child.inode.is_dir() && target.inode.is_dir() {
+                return_errno_with_message!(Errno::EISDIR, "cannot replace directory with non-directory");
+            }
+
+            if old_parent_inode == new_parent_inode {
+                let mut parent = self.get_inode_ref(old_parent_inode);
+                self.dir_remove_target(&mut parent, &mut target, new_name)?;
+                self.dir_add_entry(&mut parent, &child, new_name)?;
+                self.dir_remove_entry(&mut parent, old_name)?;
+                self.write_back_inode(&mut parent);
+                return Ok(EOK);
+            }
+
+            let mut old_parent = self.get_inode_ref(old_parent_inode);
+            let mut new_parent = self.get_inode_ref(new_parent_inode);
+            self.dir_remove_target(&mut new_parent, &mut target, new_name)?;
+            self.dir_add_entry(&mut new_parent, &child, new_name)?;
+
+            if child.inode.is_dir() {
+                self.dir_update_dotdot(child_ino, new_parent_inode)?;
+                old_parent
+                    .inode
+                    .set_links_count(old_parent.inode.links_count().saturating_sub(1));
+                new_parent
+                    .inode
+                    .set_links_count(new_parent.inode.links_count() + 1);
+            }
+
+            self.dir_remove_entry(&mut old_parent, old_name)?;
+            self.write_back_inode(&mut old_parent);
+            self.write_back_inode(&mut new_parent);
+            return Ok(EOK);
+        }
+
+        if old_parent_inode == new_parent_inode {
+            let mut parent = self.get_inode_ref(old_parent_inode);
+            self.dir_add_entry(&mut parent, &child, new_name)?;
+            self.dir_remove_entry(&mut parent, old_name)?;
+            self.write_back_inode(&mut parent);
+            return Ok(EOK);
+        }
+
+        let mut old_parent = self.get_inode_ref(old_parent_inode);
+        let mut new_parent = self.get_inode_ref(new_parent_inode);
+        self.dir_add_entry(&mut new_parent, &child, new_name)?;
+
+        if child.inode.is_dir() {
+            self.dir_update_dotdot(child_ino, new_parent_inode)?;
+            old_parent
+                .inode
+                .set_links_count(old_parent.inode.links_count().saturating_sub(1));
+            new_parent
+                .inode
+                .set_links_count(new_parent.inode.links_count() + 1);
+        }
+
+        self.dir_remove_entry(&mut old_parent, old_name)?;
+        self.write_back_inode(&mut old_parent);
+        self.write_back_inode(&mut new_parent);
+
+        Ok(EOK)
+    }
 }
 
 pub fn copy_dir_entry_to_array(header: &Ext4DirEntry, array: &mut [u8], offset: usize) {

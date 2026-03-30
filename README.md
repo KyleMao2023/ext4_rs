@@ -47,6 +47,7 @@ cargo run ./foo/
 | file_remove  | ✅   |
 | umount       | ✅   |
 | dir_remove   | ✅   |
+| mv           | ✅   |
 
 
 
