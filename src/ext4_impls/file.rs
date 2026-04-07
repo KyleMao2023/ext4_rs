@@ -327,7 +327,8 @@ impl Ext4 {
         let blocks_to_allocate = if iblk_idx >= ifile_blocks as usize {
             total_blocks_needed
         } else {
-            max(0, total_blocks_needed - (ifile_blocks as usize - iblk_idx))
+            let existing = (ifile_blocks as usize).saturating_sub(iblk_idx);
+            total_blocks_needed.saturating_sub(existing)
         };
 
         if blocks_to_allocate > 0 {
