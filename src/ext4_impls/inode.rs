@@ -77,10 +77,12 @@ impl Ext4 {
         if let Ok(path) = search_path {
             // get the last path
             let path = path.path.last().unwrap();
-
+            
             // get physical block id
             let fblock = path.pblock;
-
+            
+            assert!(fblock < EXT_MAX_BLOCKS.into(), "physical block id {} exceeds maximum {}", fblock, EXT_MAX_BLOCKS);
+            
             return Ok(fblock);
         }
 
@@ -428,11 +430,20 @@ impl Ext4 {
             return Ok(inode_ref.inode.root_extent_at(pos));
         }
 
-        let mut current_header = root_header;
-        let mut current_block = inode_ref.inode.root_extent_block();
+        let last_index_pos = root_header.entries_count as usize - 1;
+        let mut current_block = {
+            let root_data: &[u8; 60] = unsafe {
+                core::mem::transmute::<&[u32; 15], &[u8; 60]>(&inode_ref.inode.block)
+            };
+            let last_idx = Ext4ExtentIndex::load_from_u8(
+                &root_data[EXT4_EXTENT_HEADER_SIZE
+                    + last_index_pos * EXT4_EXTENT_INDEX_SIZE..],
+            );
+            last_idx.get_pblock()
+        };
         let mut depth = root_header.depth;
 
-        while depth > 0 {
+        while depth > 1 {
             let index_block = Block::load(&self.block_device, current_block as usize * BLOCK_SIZE);
             let index_header = Ext4ExtentHeader::load_from_u8(&index_block.data[..]);
             if index_header.entries_count == 0 {
@@ -444,8 +455,7 @@ impl Ext4 {
                 &index_block.data[EXT4_EXTENT_HEADER_SIZE
                     + (index_header.entries_count - 1) as usize * EXT4_EXTENT_INDEX_SIZE..],
             );
-            current_block = last_idx.leaf_lo as u64 | ((last_idx.leaf_hi as u64) << 32);
-            current_header = index_header;
+            current_block = last_idx.get_pblock();
             depth -= 1;
         }
 

@@ -490,21 +490,19 @@ impl Ext4 {
     }
 
 
-    pub fn is_system_reserved_block(&self, block_num: u64, _bgid: u32) -> bool {
-
-        // 如果缓存未初始化，则不判断
-        if self.system_zone_cache.is_none() {
-            return false;
-        }
-        // 查缓存
+    fn system_reserved_range(&self, block_num: u64, bgid: u32) -> Option<(u64, u64)> {
         if let Some(zones) = &self.system_zone_cache {
             for zone in zones {
-                if block_num >= zone.start_blk && block_num <= zone.end_blk {
-                    return true;
+                if zone.group == bgid && block_num >= zone.start_blk && block_num <= zone.end_blk {
+                    return Some((zone.start_blk, zone.end_blk));
                 }
             }
         }
-        false
+        None
+    }
+
+    pub fn is_system_reserved_block(&self, block_num: u64, bgid: u32) -> bool {
+        self.system_reserved_range(block_num, bgid).is_some()
     }
     /// Optimized block allocation inspired by lwext4
     /// 
@@ -572,6 +570,8 @@ impl Ext4 {
             let first_in_bg_index = self.addr_to_idx_bg(first_in_bg);
             let idx_in_bg = first_in_bg_index; // Start from the beginning of the group
             let blocks_per_group = super_block.blocks_per_group();
+            let end_idx = core::cmp::min(blocks_per_group, BLOCK_SIZE as u32 * 8);
+            let end_block = self.bg_idx_to_addr(end_idx, bgid);
             
             // Find free blocks in bitmap
             let mut found_blocks = 0;
@@ -580,18 +580,23 @@ impl Ext4 {
             let mut current_idx = idx_in_bg;
             
             // First try to find blocks in a simple loop starting from current_idx
-            while found_blocks < max_to_find && current_idx < blocks_per_group {
-                // Ensure we don't go beyond bitmap size (BLOCK_SIZE * 8 bits)
-                if current_idx >= BLOCK_SIZE as u32 * 8 {
-                    break;
-                }
-                
+            while found_blocks < max_to_find && current_idx < end_idx {
                 if ext4_bmap_is_bit_clr(&bitmap_data, current_idx) {
                     // Check if this is a system reserved block
                     let block_num = self.bg_idx_to_addr(current_idx, bgid);
-                    if self.is_system_reserved_block(block_num, bgid) {
-                        log::error!("[Block Alloc] System reserved block found at {:x?}", block_num);
-                        current_idx += 1;
+                    if let Some((zone_start, zone_end)) = self.system_reserved_range(block_num, bgid) {
+                        log::debug!(
+                            "[Block Alloc] Skipping system reserved blocks {:x?}..={:x?} in bg {}",
+                            zone_start,
+                            zone_end,
+                            bgid
+                        );
+                        let next_block = zone_end.saturating_add(1);
+                        current_idx = if next_block >= end_block {
+                            end_idx
+                        } else {
+                            core::cmp::max(self.addr_to_idx_bg(next_block), current_idx + 1)
+                        };
                         continue;
                     }
                     
@@ -623,8 +628,9 @@ impl Ext4 {
                 let mut start_idx = current_idx;
                 
                 while found_blocks < max_to_find {
-                    // Make sure we don't exceed the bitmap size
-                    let end_idx = core::cmp::min(blocks_per_group, BLOCK_SIZE as u32 * 8);
+                    if start_idx >= end_idx {
+                        break;
+                    }
                     
                     // Find next clear bit
                     if !ext4_bmap_bit_find_clr(&bitmap_data, start_idx, end_idx, &mut rel_blk_idx) {
@@ -633,10 +639,20 @@ impl Ext4 {
                     
                     // Check if this is a system reserved block
                     let block_num = self.bg_idx_to_addr(rel_blk_idx, bgid);
-                    if self.is_system_reserved_block(block_num, bgid) {
+                    if let Some((zone_start, zone_end)) = self.system_reserved_range(block_num, bgid) {
                         // Skip this block and continue search
-                        log::error!("[Block Alloc] System reserved block found at {:x?} bgid {}", block_num, bgid);
-                        start_idx = rel_blk_idx + 1;
+                        log::debug!(
+                            "[Block Alloc] Skipping system reserved blocks {:x?}..={:x?} in bg {}",
+                            zone_start,
+                            zone_end,
+                            bgid
+                        );
+                        let next_block = zone_end.saturating_add(1);
+                        start_idx = if next_block >= end_block {
+                            end_idx
+                        } else {
+                            core::cmp::max(self.addr_to_idx_bg(next_block), rel_blk_idx + 1)
+                        };
                         continue;
                     }
                     

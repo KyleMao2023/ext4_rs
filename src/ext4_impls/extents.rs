@@ -34,18 +34,17 @@ impl Ext4 {
             let index_pos = node.binsearch_idx(lblock);
             if let Some(pos) = index_pos {
                 let index = node.get_index(pos)?;
-                let next_block = index.leaf_lo;
+                let next_block = index.get_pblock();
 
                 search_path.path.push(ExtentPathNode {
                     header: node.header,
                     index: Some(index),
                     extent: None,
                     position: pos,
-                    pblock: next_block as u64,
+                    pblock: next_block,
                     pblock_of_node,
                 });
 
-                let next_block = search_path.path.last().unwrap().index.unwrap().leaf_lo;
                 let mut next_data = self
                     .block_device
                     .read_offset(next_block as usize * BLOCK_SIZE);
