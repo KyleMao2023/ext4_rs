@@ -2,7 +2,15 @@ use crate::prelude::*;
 use crate::utils::*;
 
 use super::*;
-#[repr(C)]
+
+const EXT4_SUPERBLOCK_DISK_SIZE: usize = 0x400;
+const EXT4_SB_FREE_BLOCKS_COUNT_LO_OFFSET: usize = 0x0c;
+const EXT4_SB_FREE_INODES_COUNT_OFFSET: usize = 0x10;
+const EXT4_SB_FREE_BLOCKS_COUNT_HI_OFFSET: usize = 0x158;
+const EXT4_SB_CHECKSUM_OFFSET: usize = 0x3fc;
+const EXT4_SUPER_MAGIC: u16 = 0xEF53;
+
+#[repr(C, packed)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ext4Superblock {
     pub inodes_count: u32,         // Inodes count
@@ -105,6 +113,15 @@ pub struct Ext4Superblock {
 }
 
 impl Ext4Superblock {
+    /// Basic sanity validation for mount-time checks.
+    pub fn is_valid_basic(&self) -> bool {
+        self.magic == EXT4_SUPER_MAGIC && self.blocks_per_group != 0 && self.inodes_per_group != 0
+    }
+
+    pub fn magic(&self) -> u16 {
+        self.magic
+    }
+
     /// Returns the size of inode structure.
     pub fn inode_size(&self) -> u16 {
         self.inode_size
@@ -152,10 +169,13 @@ impl Ext4Superblock {
 
     /// Returns the number of block groups.
     pub fn block_group_count(&self) -> u32 {
+        if self.blocks_per_group == 0 {
+            panic!("Invalid ext4 superblock: blocks_per_group=0 (possible superblock corruption)");
+        }
+
         let blocks_count = (self.blocks_count_hi as u64) << 32 | self.blocks_count_lo as u64;
 
         let blocks_per_group = self.blocks_per_group as u64;
-
         let mut block_group_count = blocks_count / blocks_per_group;
 
         if (blocks_count % blocks_per_group) != 0 {
@@ -199,6 +219,11 @@ impl Ext4Superblock {
         self.free_inodes_count -= 1;
     }
 
+    /// 增加超级块中的空闲 inode 计数。
+    pub fn increase_free_inodes_count(&mut self) {
+        self.free_inodes_count += 1;
+    }
+
     pub fn free_blocks_count(&self) -> u64 {
         self.free_blocks_count_lo as u64 | ((self.free_blocks_count_hi as u64) << 32).to_le()
     }
@@ -210,23 +235,36 @@ impl Ext4Superblock {
     }
 
     pub fn sync_to_disk(&self, block_device: &Arc<dyn BlockDevice>) {
-        let data = unsafe {
-            core::slice::from_raw_parts(self as *const _ as *const u8, size_of::<Ext4Superblock>())
-        };
-        block_device.write_offset(SUPERBLOCK_OFFSET, data);
+        let mut raw = block_device.read_offset(SUPERBLOCK_OFFSET);
+        raw.truncate(EXT4_SUPERBLOCK_DISK_SIZE);
+
+        raw[EXT4_SB_FREE_BLOCKS_COUNT_LO_OFFSET..EXT4_SB_FREE_BLOCKS_COUNT_LO_OFFSET + 4]
+            .copy_from_slice(&self.free_blocks_count_lo.to_le_bytes());
+        raw[EXT4_SB_FREE_INODES_COUNT_OFFSET..EXT4_SB_FREE_INODES_COUNT_OFFSET + 4]
+            .copy_from_slice(&self.free_inodes_count.to_le_bytes());
+        raw[EXT4_SB_FREE_BLOCKS_COUNT_HI_OFFSET..EXT4_SB_FREE_BLOCKS_COUNT_HI_OFFSET + 4]
+            .copy_from_slice(&self.free_blocks_count_hi.to_le_bytes());
+
+        block_device.write_offset(SUPERBLOCK_OFFSET, &raw[..EXT4_SUPERBLOCK_DISK_SIZE]);
     }
 
     pub fn sync_to_disk_with_csum(&mut self, block_device: &Arc<dyn BlockDevice>) {
-        let data = unsafe {
-            core::slice::from_raw_parts(self as *const _ as *const u8, size_of::<Ext4Superblock>())
-        };
-        let checksum = ext4_crc32c(EXT4_CRC32_INIT, data, 0x3fc);
+        let mut raw = block_device.read_offset(SUPERBLOCK_OFFSET);
+        raw.truncate(EXT4_SUPERBLOCK_DISK_SIZE);
 
+        raw[EXT4_SB_FREE_BLOCKS_COUNT_LO_OFFSET..EXT4_SB_FREE_BLOCKS_COUNT_LO_OFFSET + 4]
+            .copy_from_slice(&self.free_blocks_count_lo.to_le_bytes());
+        raw[EXT4_SB_FREE_INODES_COUNT_OFFSET..EXT4_SB_FREE_INODES_COUNT_OFFSET + 4]
+            .copy_from_slice(&self.free_inodes_count.to_le_bytes());
+        raw[EXT4_SB_FREE_BLOCKS_COUNT_HI_OFFSET..EXT4_SB_FREE_BLOCKS_COUNT_HI_OFFSET + 4]
+            .copy_from_slice(&self.free_blocks_count_hi.to_le_bytes());
+
+        let checksum = ext4_crc32c(EXT4_CRC32_INIT, &raw[..EXT4_SB_CHECKSUM_OFFSET], EXT4_SB_CHECKSUM_OFFSET as u32);
         self.checksum = checksum;
-        let data = unsafe {
-            core::slice::from_raw_parts(self as *const _ as *const u8, size_of::<Ext4Superblock>())
-        };
-        block_device.write_offset(SUPERBLOCK_OFFSET, data);
+        raw[EXT4_SB_CHECKSUM_OFFSET..EXT4_SB_CHECKSUM_OFFSET + 4]
+            .copy_from_slice(&checksum.to_le_bytes());
+
+        block_device.write_offset(SUPERBLOCK_OFFSET, &raw[..EXT4_SUPERBLOCK_DISK_SIZE]);
     }
 
     pub fn incompat_features(&self) -> u32 {

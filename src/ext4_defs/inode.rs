@@ -33,6 +33,7 @@ pub struct Ext4Inode {
     pub i_crtime: u32,       // Creation time
     pub i_crtime_extra: u32, // Extra creation time (nanosec << 2 | epoch)
     pub i_version_hi: u32,   // Higher 32 bits of version
+    pub i_projid: u32,       // Project ID
 }
 
 #[repr(C)]
@@ -333,9 +334,117 @@ impl Ext4Inode {
 pub struct Ext4InodeRef {
     pub inode_num: u32,
     pub inode: Ext4Inode,
+    pub raw_inode: Vec<u8>,
 }
 
 impl Ext4Inode {
+    /// 从磁盘 inode 原始字节解析出内存中的 inode 结构。
+    pub fn from_bytes(raw: &[u8]) -> Self {
+        let mut inode = Ext4Inode::default();
+        let mut offset = 0usize;
+
+        let read_u16 = |buf: &[u8], off: &mut usize| -> u16 {
+            let value = u16::from_le_bytes([buf[*off], buf[*off + 1]]);
+            *off += 2;
+            value
+        };
+        let read_u32 = |buf: &[u8], off: &mut usize| -> u32 {
+            let value = u32::from_le_bytes([buf[*off], buf[*off + 1], buf[*off + 2], buf[*off + 3]]);
+            *off += 4;
+            value
+        };
+
+        inode.mode = read_u16(raw, &mut offset);
+        inode.uid = read_u16(raw, &mut offset);
+        inode.size = read_u32(raw, &mut offset);
+        inode.atime = read_u32(raw, &mut offset);
+        inode.ctime = read_u32(raw, &mut offset);
+        inode.mtime = read_u32(raw, &mut offset);
+        inode.dtime = read_u32(raw, &mut offset);
+        inode.gid = read_u16(raw, &mut offset);
+        inode.links_count = read_u16(raw, &mut offset);
+        inode.blocks = read_u32(raw, &mut offset);
+        inode.flags = read_u32(raw, &mut offset);
+        inode.osd1 = read_u32(raw, &mut offset);
+        for entry in inode.block.iter_mut() {
+            *entry = read_u32(raw, &mut offset);
+        }
+        inode.generation = read_u32(raw, &mut offset);
+        inode.file_acl = read_u32(raw, &mut offset);
+        inode.size_hi = read_u32(raw, &mut offset);
+        inode.faddr = read_u32(raw, &mut offset);
+        inode.osd2.l_i_blocks_high = read_u16(raw, &mut offset);
+        inode.osd2.l_i_file_acl_high = read_u16(raw, &mut offset);
+        inode.osd2.l_i_uid_high = read_u16(raw, &mut offset);
+        inode.osd2.l_i_gid_high = read_u16(raw, &mut offset);
+        inode.osd2.l_i_checksum_lo = read_u16(raw, &mut offset);
+        inode.osd2.l_i_reserved = read_u16(raw, &mut offset);
+        inode.i_extra_isize = read_u16(raw, &mut offset);
+        inode.i_checksum_hi = read_u16(raw, &mut offset);
+        inode.i_ctime_extra = read_u32(raw, &mut offset);
+        inode.i_mtime_extra = read_u32(raw, &mut offset);
+        inode.i_atime_extra = read_u32(raw, &mut offset);
+        inode.i_crtime = read_u32(raw, &mut offset);
+        inode.i_crtime_extra = read_u32(raw, &mut offset);
+        inode.i_version_hi = read_u32(raw, &mut offset);
+        inode.i_projid = read_u32(raw, &mut offset);
+
+        inode
+    }
+
+    /// 将内存中的 inode 字段写回到磁盘 inode 原始字节缓冲区。
+    fn write_to_bytes(&self, raw: &mut [u8]) {
+        let mut offset = 0usize;
+
+        let write_u16 = |buf: &mut [u8], off: &mut usize, value: u16| {
+            let bytes = value.to_le_bytes();
+            buf[*off..*off + 2].copy_from_slice(&bytes);
+            *off += 2;
+        };
+        let write_u32 = |buf: &mut [u8], off: &mut usize, value: u32| {
+            let bytes = value.to_le_bytes();
+            buf[*off..*off + 4].copy_from_slice(&bytes);
+            *off += 4;
+        };
+
+        write_u16(raw, &mut offset, self.mode);
+        write_u16(raw, &mut offset, self.uid);
+        write_u32(raw, &mut offset, self.size);
+        write_u32(raw, &mut offset, self.atime);
+        write_u32(raw, &mut offset, self.ctime);
+        write_u32(raw, &mut offset, self.mtime);
+        write_u32(raw, &mut offset, self.dtime);
+        write_u16(raw, &mut offset, self.gid);
+        write_u16(raw, &mut offset, self.links_count);
+        write_u32(raw, &mut offset, self.blocks);
+        write_u32(raw, &mut offset, self.flags);
+        write_u32(raw, &mut offset, self.osd1);
+        for entry in self.block.iter() {
+            write_u32(raw, &mut offset, *entry);
+        }
+        write_u32(raw, &mut offset, self.generation);
+        write_u32(raw, &mut offset, self.file_acl);
+        write_u32(raw, &mut offset, self.size_hi);
+        write_u32(raw, &mut offset, self.faddr);
+        write_u16(raw, &mut offset, self.osd2.l_i_blocks_high);
+        write_u16(raw, &mut offset, self.osd2.l_i_file_acl_high);
+        write_u16(raw, &mut offset, self.osd2.l_i_uid_high);
+        write_u16(raw, &mut offset, self.osd2.l_i_gid_high);
+        write_u16(raw, &mut offset, self.osd2.l_i_checksum_lo);
+        write_u16(raw, &mut offset, self.osd2.l_i_reserved);
+        write_u16(raw, &mut offset, self.i_extra_isize);
+        write_u16(raw, &mut offset, self.i_checksum_hi);
+        write_u32(raw, &mut offset, self.i_ctime_extra);
+        write_u32(raw, &mut offset, self.i_mtime_extra);
+        write_u32(raw, &mut offset, self.i_atime_extra);
+        write_u32(raw, &mut offset, self.i_crtime);
+        write_u32(raw, &mut offset, self.i_crtime_extra);
+        write_u32(raw, &mut offset, self.i_version_hi);
+        write_u32(raw, &mut offset, self.i_projid);
+
+        // TODO: 当前仅显式解析到 i_projid，0xa0 之后的扩展 inode 字节先按原值保留。
+    }
+
     /// Get the depth of the extent tree from an inode.
     pub fn root_header_depth(&self) -> u16 {
         self.root_extent_header().depth
@@ -399,7 +508,7 @@ impl Ext4Inode {
     pub fn set_inode_checksum_value(
         &mut self,
         super_block: &Ext4Superblock,
-        inode_id: u32,
+        _inode_id: u32,
         checksum: u32,
     ) {
         let inode_size = super_block.inode_size();
@@ -409,42 +518,50 @@ impl Ext4Inode {
             self.i_checksum_hi = (checksum >> 16) as u16;
         }
     }
-    fn copy_to_slice(&self, slice: &mut [u8]) {
-        unsafe {
-            let inode_ptr = self as *const Ext4Inode as *const u8;
-            let array_ptr = slice.as_ptr() as *mut u8;
-            core::ptr::copy_nonoverlapping(inode_ptr, array_ptr, 0x9c);
+    /// 统一调整原始 inode 缓冲区长度，使其与超级块 inode_size 一致。
+    pub fn ensure_raw_inode_len(raw_inode: &mut Vec<u8>, inode_size: usize) {
+        if raw_inode.len() < inode_size {
+            raw_inode.resize(inode_size, 0);
+        } else if raw_inode.len() > inode_size {
+            raw_inode.truncate(inode_size);
         }
     }
-    #[allow(unused)]
-    pub fn get_inode_checksum(&mut self, inode_id: u32, super_block: &Ext4Superblock) -> u32 {
-        let inode_size = super_block.inode_size();
 
-        let orig_checksum = self.get_checksum(super_block);
-        let mut checksum = 0;
+    #[allow(unused)]
+    pub fn get_inode_checksum(
+        &mut self,
+        inode_id: u32,
+        super_block: &Ext4Superblock,
+        raw_inode: &mut Vec<u8>,
+    ) -> u32 {
+        let inode_size = super_block.inode_size() as usize;
+        Self::ensure_raw_inode_len(raw_inode, inode_size);
 
         let ino_index = inode_id;
         let ino_gen = self.generation;
 
-        // Preparation: temporarily set bg checksum to 0
         self.osd2.l_i_checksum_lo = 0;
         self.i_checksum_hi = 0;
+        self.write_to_bytes(raw_inode);
 
-        checksum = ext4_crc32c(
+        if let Some(bytes) = raw_inode.get_mut(124..126) {
+            bytes.fill(0);
+        }
+        if inode_size > 128 {
+            if let Some(bytes) = raw_inode.get_mut(130..132) {
+                bytes.fill(0);
+            }
+        }
+
+        let uuid = super_block.uuid;
+        let mut checksum = ext4_crc32c(
             EXT4_CRC32_INIT,
-            &super_block.uuid,
-            super_block.uuid.len() as u32,
+            &uuid,
+            uuid.len() as u32,
         );
         checksum = ext4_crc32c(checksum, &ino_index.to_le_bytes(), 4);
         checksum = ext4_crc32c(checksum, &ino_gen.to_le_bytes(), 4);
-
-        let mut raw_data = [0u8; 0x100];
-        self.copy_to_slice(&mut raw_data);
-
-        // inode checksum
-        checksum = ext4_crc32c(checksum, &raw_data, inode_size as u32);
-
-        self.set_inode_checksum_value(super_block, inode_id, checksum);
+        checksum = ext4_crc32c(checksum, &raw_inode[..inode_size], inode_size as u32);
 
         if inode_size == 128 {
             checksum &= 0xFFFF;
@@ -453,21 +570,34 @@ impl Ext4Inode {
         checksum
     }
 
-    pub fn set_inode_checksum(&mut self, super_block: &Ext4Superblock, inode_id: u32) {
+    pub fn set_inode_checksum(
+        &mut self,
+        super_block: &Ext4Superblock,
+        inode_id: u32,
+        raw_inode: &mut Vec<u8>,
+    ) {
         let inode_size = super_block.inode_size();
-        let checksum = self.get_inode_checksum(inode_id, super_block);
+        let checksum = self.get_inode_checksum(inode_id, super_block, raw_inode);
 
         self.osd2.l_i_checksum_lo = ((checksum << 16) >> 16) as u16;
         if inode_size > 128 {
             self.i_checksum_hi = (checksum >> 16) as u16;
         }
+        self.write_to_bytes(raw_inode);
     }
 
-    pub fn sync_inode_to_disk(&self, block_device: &Arc<dyn BlockDevice>, inode_pos: usize) {
-        let data = unsafe {
-            core::slice::from_raw_parts(self as *const _ as *const u8, size_of::<Ext4Inode>())
-        };
-        block_device.write_offset(inode_pos, data);
+    /// 按超级块 inode_size 将 inode 原始字节写回磁盘。
+    pub fn sync_inode_to_disk(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        inode_pos: usize,
+        raw_inode: &mut Vec<u8>,
+        super_block: &Ext4Superblock,
+    ) {
+        let inode_size = super_block.inode_size() as usize;
+        Self::ensure_raw_inode_len(raw_inode, inode_size);
+        self.write_to_bytes(raw_inode);
+        block_device.write_offset(inode_pos, &raw_inode[..inode_size]);
     }
 
     pub fn root_extent_block(&self) -> u64 {

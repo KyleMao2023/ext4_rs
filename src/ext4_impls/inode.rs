@@ -7,11 +7,11 @@ use crate::utils::bitmap::*;
 
 impl Ext4 {
     pub fn get_bgid_of_inode(&self, inode_num: u32) -> u32 {
-        inode_num / self.super_block.inodes_per_group()
+        (inode_num - 1) / self.super_block.inodes_per_group()
     }
 
     pub fn inode_to_bgidx(&self, inode_num: u32) -> u32 {
-        inode_num % self.super_block.inodes_per_group()
+        (inode_num - 1) % self.super_block.inodes_per_group()
     }
 
     /// Get inode disk position.
@@ -31,14 +31,15 @@ impl Ext4 {
     /// Load the inode reference from the disk.
     pub fn get_inode_ref(&self, inode_num: u32) -> Ext4InodeRef {
         let offset = self.inode_disk_pos(inode_num);
-
-        let mut ext4block = Block::load(&self.block_device, offset);
-
-        let inode: &mut Ext4Inode = ext4block.read_as_mut();
+        let inode_size = self.super_block.inode_size() as usize;
+        let mut raw_inode = self.block_device.read_offset(offset);
+        raw_inode.truncate(inode_size);
+        let inode = Ext4Inode::from_bytes(&raw_inode);
 
         Ext4InodeRef {
             inode_num,
-            inode: *inode,
+            inode,
+            raw_inode,
         }
     }
 
@@ -46,22 +47,31 @@ impl Ext4 {
     pub fn write_back_inode(&self, inode_ref: &mut Ext4InodeRef) {
         let inode_pos = self.inode_disk_pos(inode_ref.inode_num);
 
-        // make sure self.super_block is up-to-date
         inode_ref
             .inode
-            .set_inode_checksum(&self.super_block, inode_ref.inode_num);
+            .set_inode_checksum(&self.super_block, inode_ref.inode_num, &mut inode_ref.raw_inode);
         inode_ref
             .inode
-            .sync_inode_to_disk(&self.block_device, inode_pos);
+            .sync_inode_to_disk(
+                &self.block_device,
+                inode_pos,
+                &mut inode_ref.raw_inode,
+                &self.super_block,
+            );
     }
 
     /// write back inode with checksum
-    pub fn write_back_inode_without_csum(&self, inode_ref: &Ext4InodeRef) {
+    pub fn write_back_inode_without_csum(&self, inode_ref: &mut Ext4InodeRef) {
         let inode_pos = self.inode_disk_pos(inode_ref.inode_num);
 
         inode_ref
             .inode
-            .sync_inode_to_disk(&self.block_device, inode_pos);
+            .sync_inode_to_disk(
+                &self.block_device,
+                inode_pos,
+                &mut inode_ref.raw_inode,
+                &self.super_block,
+            );
     }
 
     /// Get physical block id of a logical block.
@@ -73,25 +83,42 @@ impl Ext4 {
     /// Returns:
     /// `Result<Ext4Fsblk>` - physical block id
     pub fn get_pblock_idx(&self, inode_ref: &Ext4InodeRef, lblock: Ext4Lblk) -> Result<Ext4Fsblk> {
-        let search_path = self.find_extent(inode_ref, lblock);
-        if let Ok(path) = search_path {
-            // get the last path
-            let path = path.path.last().unwrap();
-            
-            // get physical block id
-            let fblock = path.pblock;
-            
-            assert!(fblock < EXT_MAX_BLOCKS.into(), "physical block id {} exceeds maximum {}", fblock, EXT_MAX_BLOCKS);
-            
-            return Ok(fblock);
+        let path = self.find_extent(inode_ref, lblock)?;
+        let last = match path.path.last() {
+            Some(last) => last,
+            None => {
+                return_errno_with_message!(Errno::EIO, "search extent returned empty path");
+            }
+        };
+
+        let extent = match last.extent {
+            Some(extent) => extent,
+            None => {
+                return_errno_with_message!(Errno::ENOENT, "logical block is not mapped by any extent");
+            }
+        };
+
+        let first = extent.get_first_block();
+        let len = extent.get_actual_len() as u32;
+        if len == 0 {
+            return_errno_with_message!(Errno::EIO, "extent has zero length");
         }
 
-        return_errno_with_message!(Errno::EIO, "search extent fail");
+        if lblock < first || lblock >= first + len {
+            return_errno_with_message!(Errno::EIO, "logical block is outside extent range");
+        }
+
+        let fblock = lblock as u64 - first as u64 + extent.get_pblock();
+        if fblock == 0 {
+            return_errno_with_message!(Errno::EIO, "invalid physical block 0 from extent mapping");
+        }
+
+        Ok(fblock)
     }
 
     /// Allocate a new block
     pub fn allocate_new_block(&self, inode_ref: &mut Ext4InodeRef) -> Result<Ext4Fsblk> {
-        let mut super_block = self.super_block;
+        let mut super_block = self.read_super_block_from_disk();
         let inodes_per_group = super_block.inodes_per_group();
         let bgid = (inode_ref.inode_num - 1) / inodes_per_group;
         let index = (inode_ref.inode_num - 1) % inodes_per_group;

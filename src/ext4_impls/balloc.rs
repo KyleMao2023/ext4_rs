@@ -398,7 +398,7 @@ impl Ext4 {
         block_group: &mut Ext4BlockGroup,
         bgid: usize,
     ) -> Result<()> {
-        let mut super_block = self.super_block;
+        let mut super_block = self.read_super_block_from_disk();
         let block_size = BLOCK_SIZE as u64;
 
         // Update superblock free blocks count
@@ -428,20 +428,18 @@ impl Ext4 {
         let mut count = count as usize;
         let mut start = start;
 
-        let mut super_block = self.super_block;
+        let mut super_block = self.read_super_block_from_disk();
 
         let blocks_per_group = super_block.blocks_per_group();
 
-        let bgid = start / blocks_per_group as u64;
-
         let mut bg_first = start / blocks_per_group as u64;
-        let mut bg_last = (start + count as u64 - 1) / blocks_per_group as u64;
+        let bg_last = (start + count as u64 - 1) / blocks_per_group as u64;
 
         while bg_first <= bg_last {
             let idx_in_bg = start % blocks_per_group as u64;
 
             let mut bg =
-                Ext4BlockGroup::load_new(&self.block_device, &super_block, bgid as usize);
+                Ext4BlockGroup::load_new(&self.block_device, &super_block, bg_first as usize);
 
             let block_bitmap_block = bg.get_block_bitmap_block(&super_block);
             let mut raw_data = self
@@ -483,7 +481,7 @@ impl Ext4 {
             let mut fb_cnt = bg.get_free_blocks_count();
             fb_cnt += free_cnt as u64;
             bg.set_free_blocks_count(fb_cnt as u32);
-            bg.sync_to_disk_with_csum(&self.block_device, bgid as usize, &super_block);
+            bg.sync_to_disk_with_csum(&self.block_device, bg_first as usize, &super_block);
 
             bg_first += 1;
         }
@@ -526,6 +524,7 @@ impl Ext4 {
         log::debug!("[Block Alloc] Requesting {} blocks starting from bgid {}", count, *start_bgid);
         
         let super_block = &self.super_block;
+        let mut super_block_on_disk = self.read_super_block_from_disk();
         let block_group_count = super_block.block_group_count();
         
         // Validate inputs
@@ -688,10 +687,9 @@ impl Ext4 {
                 block_group.sync_to_disk_with_csum(&self.block_device, bgid as usize, super_block);
                 
                 // Update superblock free blocks count
-                let mut sb_copy = *super_block;
-                let sb_free_blocks = sb_copy.free_blocks_count();
-                sb_copy.set_free_blocks_count(sb_free_blocks - found_blocks as u64);
-                sb_copy.sync_to_disk_with_csum(&self.block_device);
+                let sb_free_blocks = super_block_on_disk.free_blocks_count();
+                super_block_on_disk.set_free_blocks_count(sb_free_blocks - found_blocks as u64);
+                super_block_on_disk.sync_to_disk_with_csum(&self.block_device);
                 
                 // Update inode blocks count
                 let blocks_per_fs_block = BLOCK_SIZE as u64 / EXT4_INODE_BLOCK_SIZE as u64;
