@@ -115,7 +115,7 @@ impl Ext4 {
 
         bg.sync_to_disk_with_csum(&self.block_device, bgid as usize, &super_block);
 
-        super_block.decrease_free_inodes_count();
+        super_block.increase_free_inodes_count();
         super_block.sync_to_disk_with_csum(&self.block_device);
     }
 }

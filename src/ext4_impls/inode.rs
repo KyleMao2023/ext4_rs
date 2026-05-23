@@ -7,11 +7,11 @@ use crate::utils::bitmap::*;
 
 impl Ext4 {
     pub fn get_bgid_of_inode(&self, inode_num: u32) -> u32 {
-        inode_num / self.super_block.inodes_per_group()
+        (inode_num - 1) / self.super_block.inodes_per_group()
     }
 
     pub fn inode_to_bgidx(&self, inode_num: u32) -> u32 {
-        inode_num % self.super_block.inodes_per_group()
+        (inode_num - 1) % self.super_block.inodes_per_group()
     }
 
     /// Get inode disk position.
