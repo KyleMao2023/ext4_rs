@@ -124,6 +124,107 @@ impl Ext4 {
         entries
     }
 
+    /// Look up one directory entry by name and return its inode number and
+    /// ext4 dirent type.
+    pub fn ext4_dir_lookup(&self, parent_inode: u32, name: &str) -> Option<(u32, u8)> {
+        let mut search_result = Ext4DirSearchResult::new(Ext4DirEntry::default());
+        self.dir_find_entry(parent_inode, name, &mut search_result)
+            .ok()
+            .map(|_| {
+                let de = search_result.dentry;
+                (de.inode, de.get_de_type())
+            })
+    }
+
+    /// Fill `buf` with `linux_dirent64` records starting at the logical
+    /// directory byte position `offset`.
+    pub fn ext4_dir_getdents64(&self, inode: u32, offset: usize, buf: &mut [u8]) -> usize {
+        let inode_ref = self.get_inode_ref(inode);
+        if !inode_ref.inode.is_dir() {
+            return 0;
+        }
+
+        let inode_size = inode_ref.inode.size() as usize;
+        if offset >= inode_size {
+            return 0;
+        }
+
+        let total_blocks = inode_size.div_ceil(BLOCK_SIZE);
+        let tail_size = core::mem::size_of::<Ext4DirEntryTail>();
+        let mut written = 0usize;
+        let mut iblock = offset / BLOCK_SIZE;
+        let mut entry_off = offset % BLOCK_SIZE;
+
+        while iblock < total_blocks {
+            let search_path = self.find_extent(&inode_ref, iblock as u32);
+            let Ok(path) = search_path else {
+                break;
+            };
+            let pblock = path.path.last().unwrap().pblock;
+            let ext4block = Block::load(&self.block_device, pblock as usize * BLOCK_SIZE);
+            let block_base = iblock * BLOCK_SIZE;
+
+            if entry_off >= BLOCK_SIZE.saturating_sub(tail_size) {
+                iblock += 1;
+                entry_off = 0;
+                continue;
+            }
+
+            while entry_off < BLOCK_SIZE - tail_size {
+                let stream_pos = block_base + entry_off;
+                if stream_pos >= inode_size {
+                    return written;
+                }
+
+                let de: Ext4DirEntry = ext4block.read_offset_as(entry_off);
+                let entry_len = de.entry_len() as usize;
+                if entry_len == 0 {
+                    return written;
+                }
+                let next_stream_pos = stream_pos + entry_len;
+
+                if de.unused() {
+                    entry_off += entry_len;
+                    continue;
+                }
+
+                let name_len = de.get_name_len();
+                let name_bytes = &de.name[..name_len];
+                let reclen = (19 + name_len + 1 + 7) & !7usize;
+                if written + reclen > buf.len() {
+                    return written;
+                }
+
+                buf[written..written + 8].copy_from_slice(&(de.inode as u64).to_le_bytes());
+                buf[written + 8..written + 16]
+                    .copy_from_slice(&(next_stream_pos as i64).to_le_bytes());
+                buf[written + 16..written + 18].copy_from_slice(&(reclen as u16).to_le_bytes());
+                buf[written + 18] = match de.get_de_type() {
+                    2 => 4,
+                    7 => 10,
+                    3 => 2,
+                    4 => 6,
+                    5 => 1,
+                    6 => 12,
+                    1 => 8,
+                    _ => 0,
+                };
+                buf[written + 19..written + 19 + name_len].copy_from_slice(name_bytes);
+                buf[written + 19 + name_len] = 0;
+                for b in &mut buf[written + 19 + name_len + 1..written + reclen] {
+                    *b = 0;
+                }
+                written += reclen;
+                entry_off += entry_len;
+            }
+
+            iblock += 1;
+            entry_off = 0;
+        }
+
+        written
+    }
+
     /// Read data from a file starting from a given offset.
     ///
     /// Reads data from the file starting at the specified inode (`ino`), with a given offset and size.
