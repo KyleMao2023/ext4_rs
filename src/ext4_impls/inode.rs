@@ -21,9 +21,15 @@ impl Ext4 {
         let inode_size = super_block.inode_size as u64;
         let group = (inode_num - 1) / inodes_per_group;
         let index = (inode_num - 1) % inodes_per_group;
-        let block_group =
-            Ext4BlockGroup::load_new(&self.block_device, &super_block, group as usize);
-        let inode_table_blk_num = block_group.get_inode_table_blk_num();
+        let inode_table_blk_num = self
+            .inode_table_cache
+            .as_ref()
+            .and_then(|tables| tables.get(group as usize))
+            .map(|entry| entry.inode_table_blk_num)
+            .unwrap_or_else(|| {
+                Ext4BlockGroup::load_new(&self.block_device, &super_block, group as usize)
+                    .get_inode_table_blk_num()
+            });
 
         inode_table_blk_num as usize * BLOCK_SIZE + index as usize * inode_size as usize
     }

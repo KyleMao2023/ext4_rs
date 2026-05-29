@@ -9,8 +9,14 @@ pub struct SystemZone {
     pub end_blk: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct InodeTableCacheEntry {
+    pub inode_table_blk_num: u32,
+}
+
 pub struct Ext4 {
     pub block_device: Arc<dyn BlockDevice>,
     pub super_block: Ext4Superblock,
     pub system_zone_cache: Option<Vec<SystemZone>>,
+    pub inode_table_cache: Option<Vec<InodeTableCacheEntry>>,
 }

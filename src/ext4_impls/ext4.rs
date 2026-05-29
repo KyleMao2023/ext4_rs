@@ -5,6 +5,19 @@ use crate::utils::*;
 use crate::ext4_defs::*;
 
 impl Ext4 {
+    pub fn get_inode_table_cache(&self) -> Vec<InodeTableCacheEntry> {
+        let mut tables = Vec::new();
+        let group_count = self.super_block.block_group_count();
+        for bgid in 0..group_count {
+            let block_group =
+                Ext4BlockGroup::load_new(&self.block_device, &self.super_block, bgid as usize);
+            tables.push(InodeTableCacheEntry {
+                inode_table_blk_num: block_group.get_inode_table_blk_num(),
+            });
+        }
+        tables
+    }
+
     /// 获取system zone缓存
     pub fn get_system_zone(&self) -> Vec<SystemZone> {
         let mut zones = Vec::new();
@@ -62,11 +75,14 @@ impl Ext4 {
             block_device,
             super_block,
             system_zone_cache: None,
+            inode_table_cache: None,
         };
         let zones = ext4_tmp.get_system_zone();
+        let inode_tables = ext4_tmp.get_inode_table_cache();
 
         Ext4 {
             system_zone_cache: Some(zones),
+            inode_table_cache: Some(inode_tables),
             ..ext4_tmp
         }
     }
