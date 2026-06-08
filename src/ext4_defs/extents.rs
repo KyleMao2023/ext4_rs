@@ -280,18 +280,8 @@ impl ExtentNode {
 impl ExtentNode {
     /// Binary search for the extent that contains the given block.
     pub fn binsearch_extent(&mut self, lblock: Ext4Lblk) -> Option<(Ext4Extent, usize)> {
-        // empty node
         if self.header.entries_count == 0 {
-            match &self.data {
-                NodeData::Root(root_data) => {
-                    let extent = Ext4Extent::load_from_u32(&root_data[3..]);
-                    return Some((extent, 0));
-                }
-                NodeData::Internal(internal_data) => {
-                    let extent = Ext4Extent::load_from_u8(&internal_data[12..]);
-                    return Some((extent, 0));
-                }
-            }
+            return None;
         }
 
         match &mut self.data {
@@ -311,8 +301,8 @@ impl ExtentNode {
                 }
                 let idx = 3 + (l - 1) * 3;
                 let ext = Ext4Extent::load_from_u32(&root_data[idx..]);
-    
-                Some((ext, l - 1))
+                (lblock >= ext.get_first_block() && lblock <= ext.get_last_block())
+                    .then_some((ext, l - 1))
             }
             NodeData::Internal(internal_data) => {
                 let mut l = 1;
@@ -331,8 +321,8 @@ impl ExtentNode {
                 }
                 let offset = size_of::<Ext4ExtentHeader>() + (l - 1) * size_of::<Ext4Extent>();
                 let mut ext = Ext4Extent::load_from_u8_mut(&mut internal_data[offset..]);
-
-                Some((ext, l - 1))
+                (lblock >= ext.get_first_block() && lblock <= ext.get_last_block())
+                    .then_some((ext, l - 1))
             }
         }
     }

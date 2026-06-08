@@ -81,14 +81,17 @@ impl Ext4 {
     pub fn get_pblock_idx(&self, inode_ref: &Ext4InodeRef, lblock: Ext4Lblk) -> Result<Ext4Fsblk> {
         let search_path = self.find_extent(inode_ref, lblock);
         if let Ok(path) = search_path {
-            // get the last path
             let path = path.path.last().unwrap();
-            
-            // get physical block id
+            let Some(extent) = path.extent else {
+                return_errno_with_message!(Errno::ENOENT, "logical block lies in a hole");
+            };
+            if lblock < extent.get_first_block() || lblock > extent.get_last_block() {
+                return_errno_with_message!(Errno::ENOENT, "logical block lies in a hole");
+            }
+
             let fblock = path.pblock;
-            
             assert!(fblock < EXT_MAX_BLOCKS.into(), "physical block id {} exceeds maximum {}", fblock, EXT_MAX_BLOCKS);
-            
+
             return Ok(fblock);
         }
 

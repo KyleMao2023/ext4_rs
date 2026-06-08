@@ -212,21 +212,21 @@ impl Ext4 {
 
             // get iblock physical block id
             let pblock_idx = match self.get_pblock_idx(&inode_ref, iblock as u32) {
-                Ok(idx) => {
-                    idx
-                },
-                Err(e) => {
+                Ok(idx) => Some(idx),
+                Err(e) if e.error() == Errno::ENOENT => None,
+                Err(_) => {
                     return_errno_with_message!(Errno::EIO, "Failed to get physical block for logical block");
                 }
             };
 
-            // read data
-            let data = self.block_device.read_offset(pblock_idx as usize * BLOCK_SIZE);
-
-            // copy data to read buffer
-            read_buf[cursor..cursor + adjust_read_size].copy_from_slice(
-                &data[unaligned_start_offset..unaligned_start_offset + adjust_read_size],
-            );
+            if let Some(pblock_idx) = pblock_idx {
+                let data = self.block_device.read_offset(pblock_idx as usize * BLOCK_SIZE);
+                read_buf[cursor..cursor + adjust_read_size].copy_from_slice(
+                    &data[unaligned_start_offset..unaligned_start_offset + adjust_read_size],
+                );
+            } else {
+                read_buf[cursor..cursor + adjust_read_size].fill(0);
+            }
 
             // update cursor and total bytes read
             cursor += adjust_read_size;
@@ -251,20 +251,19 @@ impl Ext4 {
 
             // get iblock physical block id
             let pblock_idx = match self.get_pblock_idx(&inode_ref, iblock as u32) {
-                Ok(idx) => {
-                    idx
-                },
-                Err(e) => {
+                Ok(idx) => Some(idx),
+                Err(e) if e.error() == Errno::ENOENT => None,
+                Err(_) => {
                     return_errno_with_message!(Errno::EIO, "Failed to get physical block for logical block");
                 }
             };
 
-            // read data
-            let data = self.block_device.read_offset(pblock_idx as usize * BLOCK_SIZE);
-            // log::trace!("[Read] Read block data - physical_block: {}, data_len: {}", pblock_idx, data.len());
-
-            // copy data to read buffer
-            read_buf[cursor..cursor + read_length].copy_from_slice(&data[..read_length]);
+            if let Some(pblock_idx) = pblock_idx {
+                let data = self.block_device.read_offset(pblock_idx as usize * BLOCK_SIZE);
+                read_buf[cursor..cursor + read_length].copy_from_slice(&data[..read_length]);
+            } else {
+                read_buf[cursor..cursor + read_length].fill(0);
+            }
 
             // update cursor and total bytes read
             cursor += read_length;
