@@ -392,7 +392,13 @@ impl Ext4 {
                 Ok(idx) => idx,
                 Err(e) => {
                     log::error!("[Write] Failed to get physical block for logical block {}: {:?}", iblk_idx, e);
-                    return Err(e);
+                    let allocated = self.allocate_block_for_lblk(&mut inode_ref, iblk_idx as u32)?;
+                    log::error!(
+                        "[Write] Filled hole for logical block {} with physical block {}",
+                        iblk_idx,
+                        allocated
+                    );
+                    allocated
                 }
             };
             total_blocks += 1;
@@ -433,7 +439,13 @@ impl Ext4 {
                 Ok(idx) => idx,
                 Err(e) => {
                     log::error!("[Write] Failed to get physical block for logical block {}: {:?}", iblk_idx, e);
-                    return Err(e);
+                    let allocated = self.allocate_block_for_lblk(&mut inode_ref, iblk_idx as u32)?;
+                    log::error!(
+                        "[Write] Filled hole for logical block {} with physical block {}",
+                        iblk_idx,
+                        allocated
+                    );
+                    allocated
                 }
             };
             total_blocks += 1;
@@ -562,7 +574,11 @@ impl Ext4 {
         let diff_blocks_cnt = old_blocks_cnt - new_blocks_cnt;
 
         if diff_blocks_cnt > 0{
-            self.extent_remove_space(inode_ref, new_blocks_cnt, EXT_MAX_BLOCKS)?;
+            if new_size == 0 {
+                self.extent_remove_all(inode_ref)?;
+            } else {
+                self.extent_remove_space(inode_ref, new_blocks_cnt, EXT_MAX_BLOCKS)?;
+            }
         }
 
         inode_ref.inode.set_size(new_size);

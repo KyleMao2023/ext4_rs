@@ -211,6 +211,22 @@ impl Ext4 {
         Ok(new_block)
     }
 
+    /// 为指定逻辑块分配物理块并插入 extent，用于补齐文件内 hole。
+    pub fn allocate_block_for_lblk(
+        &self,
+        inode_ref: &mut Ext4InodeRef,
+        iblock: Ext4Lblk,
+    ) -> Result<Ext4Fsblk> {
+        let new_block = self.balloc_alloc_block(inode_ref, None)?;
+        let mut newex = Ext4Extent::default();
+        newex.first_block = iblock;
+        newex.store_pblock(new_block);
+        newex.block_count = 1;
+        self.insert_extent(inode_ref, &mut newex)?;
+        self.write_back_inode(inode_ref);
+        Ok(new_block)
+    }
+
     /// Allocate a new inode
     ///
     /// Params:
