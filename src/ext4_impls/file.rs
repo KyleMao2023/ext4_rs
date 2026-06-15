@@ -6,19 +6,27 @@ use core::cmp::max;
 // use std::time::{Duration, Instant};
 
 // Flush a run of contiguous blocks to the block device
-fn flush_contiguous_write_run(
-    block_device: &Arc<dyn BlockDevice>,
+fn collect_contiguous_write_run<'a>(
+    write_runs: &mut Vec<BlockWrite<'a>>,
     run: &mut Option<(Ext4Fsblk, usize, usize)>,
-    write_buf: &[u8],
+    write_buf: &'a [u8],
 ) {
     let Some((start_pblock, start_written, blocks)) = run.take() else {
         return;
     };
     let len = blocks * BLOCK_SIZE;
-    block_device.write_offset(
-        start_pblock as usize * BLOCK_SIZE,
-        &write_buf[start_written..start_written + len],
-    );
+    write_runs.push(BlockWrite {
+        offset: start_pblock as usize * BLOCK_SIZE,
+        data: &write_buf[start_written..start_written + len],
+    });
+}
+
+fn flush_pending_write_runs(block_device: &Arc<dyn BlockDevice>, write_runs: &mut Vec<BlockWrite<'_>>) {
+    if write_runs.is_empty() {
+        return;
+    }
+    block_device.write_offsets_many(write_runs);
+    write_runs.clear();
 }
 
 impl Ext4 {
@@ -432,6 +440,7 @@ impl Ext4 {
         // Aligned write
         let mut aligned_blocks = 0;
         let mut run: Option<(Ext4Fsblk, usize, usize)> = None;
+        let mut write_runs: Vec<BlockWrite<'_>> = Vec::new();
         log::info!("[Aligned Write] Starting aligned writes for {} blocks", (write_buf_len - written + BLOCK_SIZE - 1) / BLOCK_SIZE);
         
         while written < write_buf_len {
@@ -441,7 +450,8 @@ impl Ext4 {
             let pblock_idx = match self.get_pblock_idx(&inode_ref, iblk_idx as u32) {
                 Ok(idx) => idx,
                 Err(e) => {
-                    flush_contiguous_write_run(&self.block_device, &mut run, write_buf);
+                    collect_contiguous_write_run(&mut write_runs, &mut run, write_buf);
+                    flush_pending_write_runs(&self.block_device, &mut write_runs);
                     log::error!("[Write] Failed to get physical block for logical block {}: {:?}", iblk_idx, e);
                     let allocated = self.allocate_block_for_lblk(&mut inode_ref, iblk_idx as u32)?;
                     log::error!(
@@ -465,12 +475,13 @@ impl Ext4 {
                         *blocks += 1;
                     }
                     _ => {
-                        flush_contiguous_write_run(&self.block_device, &mut run, write_buf);
+                        collect_contiguous_write_run(&mut write_runs, &mut run, write_buf);
                         run = Some((pblock_idx, written, 1));
                     }
                 }
             } else {
-                flush_contiguous_write_run(&self.block_device, &mut run, write_buf);
+                collect_contiguous_write_run(&mut write_runs, &mut run, write_buf);
+                flush_pending_write_runs(&self.block_device, &mut write_runs);
                 let mut block = Block::load(&self.block_device, block_offset);
                 block.write_offset(0, &write_buf[written..written + write_size], write_size);
                 block.sync_blk_to_disk(&self.block_device);
@@ -483,7 +494,8 @@ impl Ext4 {
                 log::trace!("[Progress] Written {} blocks, {} bytes", aligned_blocks, written);
             }
         }
-        flush_contiguous_write_run(&self.block_device, &mut run, write_buf);
+        collect_contiguous_write_run(&mut write_runs, &mut run, write_buf);
+        flush_pending_write_runs(&self.block_device, &mut write_runs);
         
         // Update file size if necessary
         let new_size = offset + written;

@@ -3,6 +3,16 @@ use crate::prelude::*;
 pub trait BlockDevice: Send + Sync + Any {
     fn read_offset(&self, offset: usize) -> Vec<u8>;
     fn write_offset(&self, offset: usize, data: &[u8]);
+    fn write_offsets_many(&self, writes: &[BlockWrite<'_>]) {
+        for write in writes {
+            self.write_offset(write.offset, write.data);
+        }
+    }
+}
+
+pub struct BlockWrite<'a> {
+    pub offset: usize,
+    pub data: &'a [u8],
 }
 
 pub struct Block {

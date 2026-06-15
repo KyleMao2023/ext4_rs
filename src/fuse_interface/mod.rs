@@ -8,7 +8,7 @@ use crate::utils::path_check;
 // export some definitions
 pub use crate::ext4_defs::Ext4;
 pub use crate::ext4_defs::BLOCK_SIZE;
-pub use crate::ext4_defs::BlockDevice;
+pub use crate::ext4_defs::{BlockDevice, BlockWrite};
 pub use crate::ext4_defs::InodeFileType;
 
 /// fuser interface for ext4
