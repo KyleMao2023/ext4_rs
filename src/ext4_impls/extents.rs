@@ -96,6 +96,10 @@ impl Ext4 {
             inode_ref.inode.root_extent_header().entries_count,
             inode_ref.inode.root_extent_header().max_entries_count,
             inode_ref.inode.root_extent_header().depth);
+
+        if self.try_merge_appended_extent(inode_ref, newex)? {
+            return Ok(());
+        }
         
         let mut search_path = self.find_extent(inode_ref, newex_first_block)?;
         
@@ -193,6 +197,71 @@ impl Ext4 {
             inode_ref.inode.root_extent_header().depth);
 
         Ok(())
+    }
+
+    fn try_merge_appended_extent(
+        &self,
+        inode_ref: &mut Ext4InodeRef,
+        new_extent: &Ext4Extent,
+    ) -> Result<bool> {
+        let root_header = inode_ref.inode.root_extent_header();
+        if root_header.entries_count == 0 {
+            return Ok(false);
+        }
+
+        match root_header.depth {
+            0 => {
+                let last_pos = root_header.entries_count as usize - 1;
+                let mut last_extent = inode_ref.inode.root_extent_at(last_pos);
+                if !self.can_merge(&last_extent, new_extent) {
+                    return Ok(false);
+                }
+                let unwritten = last_extent.is_unwritten();
+                last_extent.set_actual_len(
+                    last_extent.get_actual_len() + new_extent.get_actual_len(),
+                );
+                if unwritten {
+                    last_extent.mark_unwritten();
+                }
+                *inode_ref.inode.root_extent_mut_at(last_pos) = last_extent;
+                Ok(true)
+            }
+            1 => {
+                let root_data = unsafe {
+                    core::mem::transmute::<&[u32; 15], &[u8; 60]>(&inode_ref.inode.block)
+                };
+                let root_node = ExtentNode::load_from_data(root_data, true)?;
+                let last_index = root_node.get_index(root_header.entries_count as usize - 1)?;
+                let leaf_block = last_index.get_pblock() as usize;
+                let mut leaf = Block::load(&self.block_device, leaf_block * BLOCK_SIZE);
+                let leaf_header: Ext4ExtentHeader = leaf.read_offset_as(0);
+                if leaf_header.entries_count == 0 {
+                    return Ok(false);
+                }
+
+                let last_pos = leaf_header.entries_count as usize - 1;
+                let last_offset = core::mem::size_of::<Ext4ExtentHeader>()
+                    + last_pos * core::mem::size_of::<Ext4Extent>();
+                let mut last_extent: Ext4Extent = leaf.read_offset_as(last_offset);
+                if !self.can_merge(&last_extent, new_extent) {
+                    return Ok(false);
+                }
+
+                let unwritten = last_extent.is_unwritten();
+                last_extent.set_actual_len(
+                    last_extent.get_actual_len() + new_extent.get_actual_len(),
+                );
+                if unwritten {
+                    last_extent.mark_unwritten();
+                }
+                let extent_slot: &mut Ext4Extent = leaf.read_offset_as_mut(last_offset);
+                *extent_slot = last_extent;
+                leaf.sync_blk_to_disk(&self.block_device);
+                self.set_extent_block_checksum(inode_ref, leaf_block)?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     /// Get extent from the node at the given position.

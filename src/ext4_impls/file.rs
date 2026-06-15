@@ -5,6 +5,22 @@ use crate::ext4_defs::*;
 use core::cmp::max;
 // use std::time::{Duration, Instant};
 
+// Flush a run of contiguous blocks to the block device
+fn flush_contiguous_write_run(
+    block_device: &Arc<dyn BlockDevice>,
+    run: &mut Option<(Ext4Fsblk, usize, usize)>,
+    write_buf: &[u8],
+) {
+    let Some((start_pblock, start_written, blocks)) = run.take() else {
+        return;
+    };
+    let len = blocks * BLOCK_SIZE;
+    block_device.write_offset(
+        start_pblock as usize * BLOCK_SIZE,
+        &write_buf[start_written..start_written + len],
+    );
+}
+
 impl Ext4 {
     /// Link a child inode to a parent directory
     ///
@@ -405,23 +421,9 @@ impl Ext4 {
 
             let mut block = Block::load(&self.block_device, pblock_idx as usize * BLOCK_SIZE);
             
-            // Read existing data if needed
-            if unaligned > 0 || len < BLOCK_SIZE {
-                let existing_data = self.block_device.read_offset(pblock_idx as usize * BLOCK_SIZE);
-                block.data.copy_from_slice(&existing_data);
-            }
-            
             block.write_offset(unaligned, &write_buf[..len], len);
-
-            // Verify write
             block.sync_blk_to_disk(&self.block_device);
-            let verify_block = Block::load(&self.block_device, pblock_idx as usize * BLOCK_SIZE);
-            if verify_block.data[unaligned..unaligned + len] != write_buf[..len] {
-                log::error!("[Write] Verification failed for unaligned write at block {}", pblock_idx);
-                return return_errno_with_message!(Errno::EIO, "Write verification failed");
-            }
             drop(block);
-            drop(verify_block);
 
             written += len;
             iblk_idx += 1;
@@ -429,6 +431,7 @@ impl Ext4 {
 
         // Aligned write
         let mut aligned_blocks = 0;
+        let mut run: Option<(Ext4Fsblk, usize, usize)> = None;
         log::info!("[Aligned Write] Starting aligned writes for {} blocks", (write_buf_len - written + BLOCK_SIZE - 1) / BLOCK_SIZE);
         
         while written < write_buf_len {
@@ -438,6 +441,7 @@ impl Ext4 {
             let pblock_idx = match self.get_pblock_idx(&inode_ref, iblk_idx as u32) {
                 Ok(idx) => idx,
                 Err(e) => {
+                    flush_contiguous_write_run(&self.block_device, &mut run, write_buf);
                     log::error!("[Write] Failed to get physical block for logical block {}: {:?}", iblk_idx, e);
                     let allocated = self.allocate_block_for_lblk(&mut inode_ref, iblk_idx as u32)?;
                     log::error!(
@@ -451,26 +455,26 @@ impl Ext4 {
             total_blocks += 1;
 
             let block_offset = pblock_idx as usize * BLOCK_SIZE;
-            let mut block = Block::load(&self.block_device, block_offset);
             let write_size = min(BLOCK_SIZE, write_buf_len - written);
-            
-            // For partial block writes, read existing data first
-            if write_size < BLOCK_SIZE {
-                let existing_data = self.block_device.read_offset(block_offset);
-                block.data.copy_from_slice(&existing_data);
-            }
-            
-            block.write_offset(0, &write_buf[written..written + write_size], write_size);
 
-            // Verify write
-            block.sync_blk_to_disk(&self.block_device);
-            let verify_block = Block::load(&self.block_device, block_offset);
-            if verify_block.data[..write_size] != write_buf[written..written + write_size] {
-                log::error!("[Write] Verification failed for aligned write at block {}", pblock_idx);
-                return return_errno_with_message!(Errno::EIO, "Write verification failed");
+            if write_size == BLOCK_SIZE {
+                match run.as_mut() {
+                    Some((start_pblock, _, blocks))
+                        if pblock_idx == *start_pblock + *blocks as Ext4Fsblk =>
+                    {
+                        *blocks += 1;
+                    }
+                    _ => {
+                        flush_contiguous_write_run(&self.block_device, &mut run, write_buf);
+                        run = Some((pblock_idx, written, 1));
+                    }
+                }
+            } else {
+                flush_contiguous_write_run(&self.block_device, &mut run, write_buf);
+                let mut block = Block::load(&self.block_device, block_offset);
+                block.write_offset(0, &write_buf[written..written + write_size], write_size);
+                block.sync_blk_to_disk(&self.block_device);
             }
-            drop(block);
-            drop(verify_block);
             
             written += write_size;
             iblk_idx += 1;
@@ -479,6 +483,7 @@ impl Ext4 {
                 log::trace!("[Progress] Written {} blocks, {} bytes", aligned_blocks, written);
             }
         }
+        flush_contiguous_write_run(&self.block_device, &mut run, write_buf);
         
         // Update file size if necessary
         let new_size = offset + written;
@@ -491,15 +496,9 @@ impl Ext4 {
                 return return_errno_with_message!(Errno::EFBIG, "File size too large");
             }
             
-            inode_ref.inode.set_size(new_size as u64);
-            self.write_back_inode(&mut inode_ref);
-            
-            // Verify file size update
-            let verify_inode = self.get_inode_ref(inode);
-            if verify_inode.inode.size() != new_size as u64 {
-                log::error!("[Write] File size update verification failed: expected {}, got {}", 
-                    new_size, verify_inode.inode.size());
-                return return_errno_with_message!(Errno::EIO, "File size update verification failed");
+            if inode_ref.inode.size() != new_size as u64 {
+                inode_ref.inode.set_size(new_size as u64);
+                self.write_back_inode(&mut inode_ref);
             }
         }
 
