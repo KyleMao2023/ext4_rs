@@ -286,18 +286,21 @@ impl ExtentNode {
 
         match &mut self.data {
             NodeData::Root(root_data) => {
-                let header = self.header;
-                let mut l = 1;
-                let mut r = header.entries_count as usize - 1;
-                while l <= r {
+                let entries = self.header.entries_count as usize;
+                let mut l = 0;
+                let mut r = entries;
+                while l < r {
                     let m = l + (r - l) / 2;
                     let idx = 3 + m * 3;
                     let ext = Ext4Extent::load_from_u32(&root_data[idx..]);
                     if lblock < ext.first_block {
-                        r = m - 1;
+                        r = m;
                     } else {
                         l = m + 1;
                     }
+                }
+                if l == 0 {
+                    return None;
                 }
                 let idx = 3 + (l - 1) * 3;
                 let ext = Ext4Extent::load_from_u32(&root_data[idx..]);
@@ -305,19 +308,23 @@ impl ExtentNode {
                     .then_some((ext, l - 1))
             }
             NodeData::Internal(internal_data) => {
-                let mut l = 1;
-                let mut r = (self.header.entries_count - 1) as usize;
+                let entries = self.header.entries_count as usize;
+                let mut l = 0;
+                let mut r = entries;
     
-                while l <= r {
+                while l < r {
                     let m = l + (r - l) / 2;
                     let offset = size_of::<Ext4ExtentHeader>() + m * size_of::<Ext4Extent>();
                     let mut ext = Ext4Extent::load_from_u8_mut(&mut internal_data[offset..]);
 
                     if lblock < ext.first_block {
-                        r = m - 1;
+                        r = m;
                     } else {
                         l = m + 1;  // Otherwise, move to the right half
                     }
+                }
+                if l == 0 {
+                    return None;
                 }
                 let offset = size_of::<Ext4ExtentHeader>() + (l - 1) * size_of::<Ext4Extent>();
                 let mut ext = Ext4Extent::load_from_u8_mut(&mut internal_data[offset..]);
@@ -339,19 +346,17 @@ impl ExtentNode {
                 let start = size_of::<Ext4ExtentHeader>() / 4;
                 let indexes = &root_data[start..];
 
-                let mut l = 1; // Skip the first index
-                let mut r = self.header.entries_count as usize - 1;
+                let entries = self.header.entries_count as usize;
+                let mut l = 0;
+                let mut r = entries;
 
-                while l <= r {
+                while l < r {
                     let m = l + (r - l) / 2;
                     let offset = m * size_of::<Ext4ExtentIndex>() / 4; // Convert to u32 offset
                     let extent_index = Ext4ExtentIndex::load_from_u32(&indexes[offset..]);
 
                     if lblock < extent_index.first_block {
-                        if m == 0 {
-                            break; // Prevent underflow
-                        }
-                        r = m - 1;
+                        r = m;
                     } else {
                         l = m + 1;
                     }
@@ -368,19 +373,17 @@ impl ExtentNode {
                 let start = size_of::<Ext4ExtentHeader>();
                 let indexes = &internal_data[start..];
 
+                let entries = self.header.entries_count as usize;
                 let mut l = 0;
-                let mut r = (self.header.entries_count - 1) as usize;
+                let mut r = entries;
 
-                while l <= r {
+                while l < r {
                     let m = l + (r - l) / 2;
                     let offset = m * size_of::<Ext4ExtentIndex>();
                     let extent_index = Ext4ExtentIndex::load_from_u8(&indexes[offset..]);
 
                     if lblock < extent_index.first_block {
-                        if m == 0 {
-                            break; // Prevent underflow
-                        }
-                        r = m - 1;
+                        r = m;
                     } else {
                         l = m + 1;
                     }
