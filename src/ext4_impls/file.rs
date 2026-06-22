@@ -21,6 +21,20 @@ fn collect_contiguous_write_run<'a>(
     });
 }
 
+fn collect_contiguous_write_plan(
+    write_runs: &mut Vec<(usize, usize, usize)>,
+    run: &mut Option<(Ext4Fsblk, usize, usize)>,
+) {
+    let Some((start_pblock, start_written, blocks)) = run.take() else {
+        return;
+    };
+    write_runs.push((
+        start_pblock as usize * BLOCK_SIZE,
+        start_written,
+        blocks * BLOCK_SIZE,
+    ));
+}
+
 fn flush_pending_write_runs(block_device: &Arc<dyn BlockDevice>, write_runs: &mut Vec<BlockWrite<'_>>) {
     if write_runs.is_empty() {
         return;
@@ -30,6 +44,99 @@ fn flush_pending_write_runs(block_device: &Arc<dyn BlockDevice>, write_runs: &mu
 }
 
 impl Ext4 {
+    /// Prepare a fully block-aligned file write without issuing data I/O.
+    ///
+    /// Returns `Ok(None)` for cases that should use the generic write path
+    /// (partial-block writes). The returned runs are `(disk_offset,
+    /// buffer_offset, len)` and may be submitted after the outer filesystem
+    /// lock is released.
+    pub fn prepare_aligned_write_at(
+        &self,
+        inode: u32,
+        offset: usize,
+        write_len: usize,
+    ) -> Result<Option<(usize, Vec<(usize, usize, usize)>)>> {
+        if write_len == 0 {
+            return Ok(Some((0, Vec::new())));
+        }
+        if offset % BLOCK_SIZE != 0 || write_len % BLOCK_SIZE != 0 {
+            return Ok(None);
+        }
+
+        let mut inode_ref = self.get_inode_ref(inode);
+        let file_size = inode_ref.inode.size();
+        let iblock_start = offset / BLOCK_SIZE;
+        let iblock_last = (offset + write_len) / BLOCK_SIZE;
+        let total_blocks_needed = iblock_last - iblock_start;
+        let ifile_blocks = (file_size + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64;
+        let existing_blocks = if iblock_start < ifile_blocks as usize {
+            (ifile_blocks as usize).saturating_sub(iblock_start)
+        } else {
+            0
+        };
+        let blocks_to_allocate = total_blocks_needed.saturating_sub(existing_blocks);
+
+        let mut new_blocks = 0usize;
+        if blocks_to_allocate > 0 {
+            let mut start_bgid = 0;
+            let allocated_blocks =
+                self.append_inode_pblk_batch(&mut inode_ref, &mut start_bgid, blocks_to_allocate)?;
+            if allocated_blocks.len() < blocks_to_allocate {
+                let available_blocks = existing_blocks + allocated_blocks.len();
+                if available_blocks == 0 {
+                    return return_errno_with_message!(Errno::ENOSPC, "No blocks available for write");
+                }
+            }
+            new_blocks = allocated_blocks.len();
+        }
+
+        let available_blocks = existing_blocks + new_blocks;
+        let writable_blocks = total_blocks_needed.min(available_blocks);
+        if writable_blocks == 0 {
+            return return_errno_with_message!(Errno::ENOSPC, "Not enough blocks available for write");
+        }
+
+        let mut written = 0usize;
+        let mut iblk_idx = iblock_start;
+        let write_len = writable_blocks * BLOCK_SIZE;
+        let mut run: Option<(Ext4Fsblk, usize, usize)> = None;
+        let mut write_runs = Vec::new();
+
+        while written < write_len {
+            let pblock_idx = match self.get_pblock_idx(&inode_ref, iblk_idx as u32) {
+                Ok(idx) => idx,
+                Err(_) => self.allocate_block_for_lblk(&mut inode_ref, iblk_idx as u32)?,
+            };
+
+            match run.as_mut() {
+                Some((start_pblock, _, blocks))
+                    if pblock_idx == *start_pblock + *blocks as Ext4Fsblk =>
+                {
+                    *blocks += 1;
+                }
+                _ => {
+                    collect_contiguous_write_plan(&mut write_runs, &mut run);
+                    run = Some((pblock_idx, written, 1));
+                }
+            }
+
+            written += BLOCK_SIZE;
+            iblk_idx += 1;
+        }
+        collect_contiguous_write_plan(&mut write_runs, &mut run);
+
+        let new_size = offset + written;
+        if new_size > file_size as usize {
+            if new_size > EXT4_MAX_FILE_SIZE as usize {
+                return return_errno_with_message!(Errno::EFBIG, "File size too large");
+            }
+            inode_ref.inode.set_size(new_size as u64);
+            self.write_back_inode(&mut inode_ref);
+        }
+
+        Ok(Some((written, write_runs)))
+    }
+
     /// Link a child inode to a parent directory
     ///
     /// Params:
