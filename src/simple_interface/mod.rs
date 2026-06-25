@@ -127,12 +127,28 @@ impl Ext4 {
     /// Look up one directory entry by name and return its inode number and
     /// ext4 dirent type.
     pub fn ext4_dir_lookup(&self, parent_inode: u32, name: &str) -> Option<(u32, u8)> {
+        self.ext4_dir_lookup_with_stats(parent_inode, name)
+            .map(|(inode, de_type, _blocks, _dirents)| (inode, de_type))
+    }
+
+    /// Look up one directory entry by name and return its inode number,
+    /// ext4 dirent type, and scan effort.
+    pub fn ext4_dir_lookup_with_stats(
+        &self,
+        parent_inode: u32,
+        name: &str,
+    ) -> Option<(u32, u8, usize, usize)> {
         let mut search_result = Ext4DirSearchResult::new(Ext4DirEntry::default());
         self.dir_find_entry(parent_inode, name, &mut search_result)
             .ok()
             .map(|_| {
                 let de = search_result.dentry;
-                (de.inode, de.get_de_type())
+                (
+                    de.inode,
+                    de.get_de_type(),
+                    search_result.blocks_scanned,
+                    search_result.dirents_scanned,
+                )
             })
     }
 

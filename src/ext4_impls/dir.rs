@@ -19,6 +19,8 @@ impl Ext4 {
         name: &str,
         result: &mut Ext4DirSearchResult,
     ) -> Result<usize> {
+        result.blocks_scanned = 0;
+        result.dirents_scanned = 0;
         // load parent inode
         let parent = self.get_inode_ref(parent_inode);
         assert!(parent.inode.is_dir());
@@ -42,6 +44,7 @@ impl Ext4 {
 
                 // get physical block id
                 fblock = path.pblock;
+                result.blocks_scanned += 1;
 
                 // load physical block
                 let mut ext4block =
@@ -84,6 +87,7 @@ impl Ext4 {
         // start from the first entry
         while offset < BLOCK_SIZE - core::mem::size_of::<Ext4DirEntryTail>() {
             let de: Ext4DirEntry = block.read_offset_as(offset);
+            result.dirents_scanned += 1;
             if !de.unused() && de.compare_name(name) {
                 result.dentry = de;
                 result.offset = offset;

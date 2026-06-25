@@ -58,6 +58,8 @@ pub struct Ext4DirEntryTail {
 pub struct Ext4DirSearchResult{
     pub dentry: Ext4DirEntry, 
     pub pblock_id: usize, // disk block id
+    pub blocks_scanned: usize, // directory blocks scanned during lookup
+    pub dirents_scanned: usize, // directory entries examined during lookup
     pub offset: usize, // offset in block
     pub prev_offset: usize, //prev direntry offset
 }
@@ -67,6 +69,8 @@ impl Ext4DirSearchResult {
         Self {
             dentry,
             pblock_id: 0,
+            blocks_scanned: 0,
+            dirents_scanned: 0,
             offset: 0,
             prev_offset: 0,
         }
