@@ -1,7 +1,34 @@
 use crate::prelude::*;
+use crate::BLOCK_SIZE;
 
 pub trait BlockDevice: Send + Sync + Any {
     fn read_offset(&self, offset: usize) -> Vec<u8>;
+    /// Read file-data blocks without the backend's normal metadata/data cache.
+    ///
+    /// The default preserves compatibility for devices that do not expose a
+    /// separate direct path.  The OS adapter overrides this for page-cache
+    /// population so regular file payload is not duplicated in block cache.
+    fn read_offset_uncached(&self, offset: usize) -> Vec<u8> {
+        self.read_offset(offset)
+    }
+    /// Read several filesystem blocks into one caller-provided buffer.
+    /// Implementations may merge physically contiguous runs; the default
+    /// preserves the old one-block-at-a-time behavior.
+    fn read_offsets(&self, offsets: &[usize], data: &mut [u8]) {
+        assert_eq!(data.len(), offsets.len() * BLOCK_SIZE);
+        for (idx, offset) in offsets.iter().copied().enumerate() {
+            let block = self.read_offset(offset);
+            data[idx * BLOCK_SIZE..(idx + 1) * BLOCK_SIZE].copy_from_slice(&block);
+        }
+    }
+    /// Read several filesystem blocks through the direct/uncached path.
+    fn read_offsets_uncached(&self, offsets: &[usize], data: &mut [u8]) {
+        assert_eq!(data.len(), offsets.len() * BLOCK_SIZE);
+        for (idx, offset) in offsets.iter().copied().enumerate() {
+            let block = self.read_offset_uncached(offset);
+            data[idx * BLOCK_SIZE..(idx + 1) * BLOCK_SIZE].copy_from_slice(&block);
+        }
+    }
     fn write_offset(&self, offset: usize, data: &[u8]);
     fn write_offsets_many(&self, writes: &[BlockWrite<'_>]) {
         for write in writes {

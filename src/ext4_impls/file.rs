@@ -299,6 +299,30 @@ impl Ext4 {
     /// Returns:
     /// `Result<usize>` - number of bytes read
     pub fn read_at(&self, inode: u32, offset: usize, read_buf: &mut [u8]) -> Result<usize> {
+        self.read_at_with_mode(inode, offset, read_buf, false)
+    }
+
+    /// Read regular-file payload without populating the block cache.
+    ///
+    /// Logical-to-physical mapping still consults the normal ext4 metadata
+    /// path, so inode/extent/directory metadata remains cached.  Only the
+    /// resulting file-data blocks use the direct device path.
+    pub fn read_at_uncached(
+        &self,
+        inode: u32,
+        offset: usize,
+        read_buf: &mut [u8],
+    ) -> Result<usize> {
+        self.read_at_with_mode(inode, offset, read_buf, true)
+    }
+
+    fn read_at_with_mode(
+        &self,
+        inode: u32,
+        offset: usize,
+        read_buf: &mut [u8],
+        uncached_data: bool,
+    ) -> Result<usize> {
         // read buf is empty, return 0
         let mut read_buf_len = read_buf.len();
         if read_buf_len == 0 {
@@ -330,7 +354,42 @@ impl Ext4 {
         
         // Ensure we don't read beyond the last block
         let iblock_last = min(iblock_last, total_blocks as usize);
-        
+
+        // The mmap/page-cache path normally asks for page-aligned, full
+        // filesystem blocks.  Resolve the logical-to-physical mapping once
+        // and let the block-device adapter merge contiguous physical runs
+        // into larger reads.  Sparse or unaligned reads retain the original
+        // path below.
+        if unaligned_start_offset == 0 && read_buf_len % BLOCK_SIZE == 0 {
+            let block_count = read_buf_len / BLOCK_SIZE;
+            let mut physical_offsets = Vec::with_capacity(block_count);
+            let mut complete = true;
+            for logical_block in iblock_start..iblock_start + block_count {
+                match self.get_pblock_idx(&inode_ref, logical_block as u32) {
+                    Ok(pblock_idx) => {
+                        physical_offsets.push(pblock_idx as usize * BLOCK_SIZE);
+                    }
+                    Err(e) if e.error() == Errno::ENOENT => {
+                        complete = false;
+                        break;
+                    }
+                    Err(_) => {
+                        complete = false;
+                        break;
+                    }
+                }
+            }
+            if complete && physical_offsets.len() == block_count {
+                if uncached_data {
+                    self.block_device
+                        .read_offsets_uncached(&physical_offsets, read_buf);
+                } else {
+                    self.block_device.read_offsets(&physical_offsets, read_buf);
+                }
+                return Ok(read_buf_len);
+            }
+        }
+
 
         // Buffer to keep track of read bytes
         let mut cursor = 0;
@@ -351,7 +410,12 @@ impl Ext4 {
             };
 
             if let Some(pblock_idx) = pblock_idx {
-                let data = self.block_device.read_offset(pblock_idx as usize * BLOCK_SIZE);
+                let data = if uncached_data {
+                    self.block_device
+                        .read_offset_uncached(pblock_idx as usize * BLOCK_SIZE)
+                } else {
+                    self.block_device.read_offset(pblock_idx as usize * BLOCK_SIZE)
+                };
                 read_buf[cursor..cursor + adjust_read_size].copy_from_slice(
                     &data[unaligned_start_offset..unaligned_start_offset + adjust_read_size],
                 );
@@ -390,7 +454,12 @@ impl Ext4 {
             };
 
             if let Some(pblock_idx) = pblock_idx {
-                let data = self.block_device.read_offset(pblock_idx as usize * BLOCK_SIZE);
+                let data = if uncached_data {
+                    self.block_device
+                        .read_offset_uncached(pblock_idx as usize * BLOCK_SIZE)
+                } else {
+                    self.block_device.read_offset(pblock_idx as usize * BLOCK_SIZE)
+                };
                 read_buf[cursor..cursor + read_length].copy_from_slice(&data[..read_length]);
             } else {
                 read_buf[cursor..cursor + read_length].fill(0);
