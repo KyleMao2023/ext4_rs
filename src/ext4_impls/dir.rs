@@ -265,17 +265,44 @@ impl Ext4 {
         };
 
         let mut offset = 0;
+        let data_end = BLOCK_SIZE - size_of::<Ext4DirEntryTail>();
 
         // Start from the first entry
-        while offset < BLOCK_SIZE - size_of::<Ext4DirEntryTail>() {
+        while offset < data_end {
             let mut de = Ext4DirEntry::try_from(&block.data[offset..]).unwrap();
+            let rec_len = de.entry_len as usize;
 
-            if de.unused() {
-                continue;
+            // Every ext4 directory record must contain at least its fixed
+            // header, be four-byte aligned, and stay within the data portion
+            // of the block.  In particular, reject rec_len == 0 instead of
+            // letting a malformed record turn this scan into an infinite
+            // loop.
+            let Some(next_offset) = offset.checked_add(rec_len) else {
+                return_errno_with_message!(Errno::EIO, "Invalid directory entry length");
+            };
+            if rec_len < size_of::<Ext4FakeDirEntry>()
+                || rec_len % 4 != 0
+                || next_offset > data_end
+            {
+                return_errno_with_message!(Errno::EIO, "Invalid directory entry length");
             }
 
-            let inode = de.inode;
-            let rec_len = de.entry_len;
+            if de.unused() {
+                // An inode number of zero denotes a reusable record.  This
+                // occurs legitimately when the first entry in a directory
+                // block is removed and therefore cannot be coalesced with a
+                // predecessor.  The old code continued without advancing
+                // `offset`, which compiled into a literal self-loop.
+                if rec_len >= required_len {
+                    let mut new_entry = Ext4DirEntry::default();
+                    new_entry.write_entry(rec_len as u16, child_inode, name, de_type);
+                    new_entry.copy_to_slice(&mut block.data, offset);
+                    block.sync_blk_to_disk(&self.block_device);
+                    return Ok(EOK);
+                }
+                offset = next_offset;
+                continue;
+            }
 
             let used_len = de.name_len as usize;
             let mut sz = core::mem::size_of::<Ext4FakeDirEntry>() + used_len;
@@ -283,7 +310,10 @@ impl Ext4 {
                 sz += 4 - used_len % 4;
             }
 
-            let free_space = rec_len as usize - sz;
+            if sz > rec_len {
+                return_errno_with_message!(Errno::EIO, "Invalid directory entry length");
+            }
+            let free_space = rec_len - sz;
 
             // If there is enough free space
             if free_space >= required_len {
@@ -308,7 +338,7 @@ impl Ext4 {
             }
 
             // Move to the next entry
-            offset += de.entry_len() as usize;
+            offset = next_offset;
         }
 
         return_errno_with_message!(Errno::ENOSPC, "No space in block for new entry");
