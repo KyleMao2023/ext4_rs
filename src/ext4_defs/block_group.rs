@@ -94,9 +94,9 @@ impl Ext4BlockGroup {
 
     /// Set the count of used directories in this block group.
     pub fn set_used_dirs_count(&mut self, s: &Ext4Superblock, cnt: u32) {
-        self.itable_unused_lo = (cnt & 0xffff) as u16; 
+        self.used_dirs_count_lo = (cnt & 0xffff) as u16;
         if s.desc_size() > EXT4_MIN_BLOCK_GROUP_DESCRIPTOR_SIZE {
-            self.itable_unused_hi = (cnt >> 16) as u16;
+            self.used_dirs_count_hi = (cnt >> 16) as u16;
         }
     }
 
@@ -201,7 +201,11 @@ impl Ext4BlockGroup {
     }
 
     /// Set the block allocation bitmap checksum for this block group.
-    pub fn set_block_group_balloc_bitmap_csum(&mut self, s: &Ext4Superblock, bitmap: &[u8]) {
+    pub fn set_block_group_balloc_bitmap_csum(
+        &mut self,
+        s: &Ext4Superblock,
+        bitmap: &[u8],
+    ) {
         let desc_size = s.desc_size();
 
         let csum = s.ext4_balloc_bitmap_csum(bitmap);
@@ -234,7 +238,11 @@ impl Ext4BlockGroup {
 
 
     /// Set the inode allocation bitmap checksum for this block group.
-    pub fn set_block_group_ialloc_bitmap_csum(&mut self, s: &Ext4Superblock, bitmap: &[u8]) {
+    pub fn set_block_group_ialloc_bitmap_csum(
+        &mut self,
+        s: &Ext4Superblock,
+        bitmap: &[u8],
+    ) {
         let desc_size = s.desc_size();
 
         let csum = s.ext4_ialloc_bitmap_csum(bitmap);

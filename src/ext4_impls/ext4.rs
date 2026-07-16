@@ -5,6 +5,17 @@ use crate::utils::*;
 use crate::ext4_defs::*;
 
 impl Ext4 {
+    /// Load the current superblock from disk.
+    ///
+    /// `Ext4::super_block` is intentionally kept as a layout/configuration
+    /// snapshot for read-only lookups.  Global allocation counters, however,
+    /// are updated by many independent operations, so mutating paths must
+    /// not derive a new value from that stale snapshot.
+    pub(crate) fn load_super_block(&self) -> Ext4Superblock {
+        let block = Block::load(&self.block_device, SUPERBLOCK_OFFSET);
+        block.read_as()
+    }
+
     pub fn get_inode_table_cache(&self) -> Vec<InodeTableCacheEntry> {
         let mut tables = Vec::new();
         let group_count = self.super_block.block_group_count();

@@ -468,25 +468,16 @@ impl Ext4 {
     pub fn dir_remove(&self, parent: u32, path: &str) -> Result<usize> {
         let mut search_result = Ext4DirSearchResult::new(Ext4DirEntry::default());
 
-        let r = self.dir_find_entry(parent, path, &mut search_result)?;
+        self.dir_find_entry(parent, path, &mut search_result)?;
 
         let mut parent_inode_ref = self.get_inode_ref(parent);
         let mut child_inode_ref = self.get_inode_ref(search_result.dentry.inode);
 
-        if self.dir_has_entry(child_inode_ref.inode_num){
-            return_errno_with_message!(Errno::ENOTSUP, "rm dir with children not supported")
-        }
-        
-        self.truncate_inode(&mut child_inode_ref, 0)?;
-
-        self.unlink(&mut parent_inode_ref, &mut child_inode_ref, path)?;
+        // Use the directory-aware removal path so the parent's link count is
+        // decremented when the child directory is removed.
+        self.dir_remove_target(&mut parent_inode_ref, &mut child_inode_ref, path)?;
 
         self.write_back_inode(&mut parent_inode_ref);
-
-        // to do
-        // ext4_inode_set_del_time
-        // ext4_inode_set_links_cnt
-        // ext4_fs_free_inode(&child)
 
         Ok(EOK)
     }

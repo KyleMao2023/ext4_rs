@@ -243,23 +243,18 @@ impl Ext4Superblock {
 }
 
 impl Ext4Superblock {
-    /// Returns the checksum of the block bitmap
+    /// Returns the checksum of a block group's block bitmap.
+    ///
+    /// This image uses the ext4 `metadata_csum` bitmap format, whose checksum
+    /// is seeded by the filesystem UUID and then covers the bitmap bytes.
     pub fn ext4_balloc_bitmap_csum(&self, bitmap: &[u8]) -> u32 {
-        let mut csum = 0;
-        let blocks_per_group = self.blocks_per_group;
-        let uuid = self.uuid;
-        csum = ext4_crc32c(EXT4_CRC32_INIT, &uuid, uuid.len() as u32);
-        csum = ext4_crc32c(csum, bitmap, blocks_per_group / 8);
-        csum
+        let csum = ext4_crc32c(EXT4_CRC32_INIT, &self.uuid, self.uuid.len() as u32);
+        ext4_crc32c(csum, bitmap, self.blocks_per_group / 8)
     }
 
-    /// Returns the checksum of the inode bitmap
+    /// Returns the checksum of an inode bitmap.
     pub fn ext4_ialloc_bitmap_csum(&self, bitmap: &[u8]) -> u32 {
-        let mut csum = 0;
-        let inodes_per_group = self.inodes_per_group;
-        let uuid = self.uuid;
-        csum = ext4_crc32c(EXT4_CRC32_INIT, &uuid, uuid.len() as u32);
-        csum = ext4_crc32c(csum, bitmap, (inodes_per_group + 7) / 8);
-        csum
+        let csum = ext4_crc32c(EXT4_CRC32_INIT, &self.uuid, self.uuid.len() as u32);
+        ext4_crc32c(csum, bitmap, (self.inodes_per_group + 7) / 8)
     }
 }
