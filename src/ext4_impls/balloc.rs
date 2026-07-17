@@ -197,6 +197,12 @@ impl Ext4 {
             let bmp_blk_adr = block_group.get_block_bitmap_block(&super_block);
             let mut bitmap_block =
                 Block::load(&self.block_device, bmp_blk_adr as usize * BLOCK_SIZE);
+            self.initialize_block_bitmap_if_needed(
+                &super_block,
+                bgid,
+                &mut block_group,
+                &mut bitmap_block.data,
+            );
 
             // Check if goal is free
             if ext4_bmap_is_bit_clr(&bitmap_block.data, idx_in_bg) {
@@ -326,6 +332,12 @@ impl Ext4 {
             let bmp_blk_adr = block_group.get_block_bitmap_block(&super_block);
             let mut bitmap_block =
                 Block::load(&self.block_device, bmp_blk_adr as usize * BLOCK_SIZE);
+            self.initialize_block_bitmap_if_needed(
+                &super_block,
+                bgid,
+                &mut block_group,
+                &mut bitmap_block.data,
+            );
 
             // Check if goal is free
             if ext4_bmap_is_bit_clr(&bitmap_block.data, idx_in_bg) {
@@ -504,6 +516,68 @@ impl Ext4 {
     pub fn is_system_reserved_block(&self, block_num: u64, bgid: u32) -> bool {
         self.system_reserved_range(block_num, bgid).is_some()
     }
+
+    /// Materialize a block bitmap that was left lazy-uninitialized by mkfs.
+    ///
+    /// The descriptor's free-block counter already excludes metadata blocks,
+    /// so this only builds the on-disk representation.  With flex_bg enabled,
+    /// metadata owned by several groups may be physically stored in this group;
+    /// therefore every cached system zone is checked by physical overlap.
+    fn initialize_block_bitmap_if_needed(
+        &self,
+        super_block: &Ext4Superblock,
+        bgid: u32,
+        block_group: &mut Ext4BlockGroup,
+        bitmap: &mut [u8],
+    ) {
+        if !block_group.has_flag(EXT4_BG_BLOCK_UNINIT) {
+            return;
+        }
+
+        bitmap.fill(0);
+
+        let blocks_per_group = super_block.blocks_per_group();
+        let bitmap_capacity = (bitmap.len() * 8) as u32;
+        let bitmap_blocks = core::cmp::min(blocks_per_group, bitmap_capacity);
+        let group_first = self.get_block_of_bgid(bgid);
+        let valid_blocks = super_block
+            .blocks_count_u64()
+            .saturating_sub(group_first)
+            .min(bitmap_blocks as u64) as u32;
+        let group_valid_end = group_first + valid_blocks as u64;
+
+        // Backup superblock, group descriptors, and reserved GDT blocks are
+        // always at the beginning of their sparse-super groups.
+        let base_meta_blocks = core::cmp::min(self.num_base_meta_blocks(bgid), valid_blocks);
+        for index in 0..base_meta_blocks {
+            ext4_bmap_bit_set(bitmap, index);
+        }
+
+        if let Some(zones) = &self.system_zone_cache {
+            for zone in zones {
+                let zone_start = core::cmp::max(zone.start_blk, group_first);
+                let zone_end = core::cmp::min(zone.end_blk.saturating_add(1), group_valid_end);
+
+                for block_num in zone_start..zone_end {
+                    let index = (block_num - group_first) as u32;
+                    ext4_bmap_bit_set(bitmap, index);
+                }
+            }
+        }
+
+        // Bits outside the filesystem in the final, partial group are not free.
+        for index in valid_blocks..bitmap_blocks {
+            ext4_bmap_bit_set(bitmap, index);
+        }
+
+        let bitmap_block = block_group.get_block_bitmap_block(super_block);
+        block_group.clear_flag(EXT4_BG_BLOCK_UNINIT);
+        block_group.set_block_group_balloc_bitmap_csum(super_block, bitmap);
+        self.block_device
+            .write_offset(bitmap_block as usize * BLOCK_SIZE, bitmap);
+        block_group.sync_to_disk_with_csum(&self.block_device, bgid as usize, super_block);
+    }
+
     /// Optimized block allocation inspired by lwext4
     /// 
     /// Params:
@@ -564,6 +638,12 @@ impl Ext4 {
             let bmp_blk_adr = block_group.get_block_bitmap_block(&super_block);
             let mut bitmap_data = 
                 self.block_device.read_offset(bmp_blk_adr as usize * BLOCK_SIZE);
+            self.initialize_block_bitmap_if_needed(
+                &super_block,
+                bgid,
+                &mut block_group,
+                &mut bitmap_data,
+            );
             
             // Compute indexes and limits
             let first_in_bg = self.get_block_of_bgid(bgid);
@@ -749,7 +829,7 @@ impl Ext4 {
 
     /// 判断group是否有superblock备份（与Linux ext4_bg_has_super一致）
     pub fn ext4_bg_has_super(&self, group: u32) -> bool {
-        if group == 0 {
+        if group <= 1 {
             return true;
         }
         // Linux: group号为3/5/7的幂也有superblock备份

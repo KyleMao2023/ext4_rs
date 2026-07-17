@@ -105,7 +105,10 @@ impl Ext4 {
         while written < write_len {
             let pblock_idx = match self.get_pblock_idx(&inode_ref, iblk_idx as u32) {
                 Ok(idx) => idx,
-                Err(_) => self.allocate_block_for_lblk(&mut inode_ref, iblk_idx as u32)?,
+                Err(error) if error.error() == Errno::ENOENT => {
+                    self.allocate_block_for_lblk(&mut inode_ref, iblk_idx as u32)?
+                }
+                Err(error) => return Err(error),
             };
 
             match run.as_mut() {
@@ -152,28 +155,24 @@ impl Ext4 {
         child: &mut Ext4InodeRef,
         name: &str,
     ) -> Result<usize> {
-        // Add a directory entry in the parent directory pointing to the child inode
-
-        // at this point should insert to existing block
-        self.dir_add_entry(parent, child, name)?;
-        self.write_back_inode_without_csum(parent);
-
-        // If this is the first link. add '.' and '..' entries
+        // Initialize a new directory before publishing it in the parent.  If
+        // allocating its first block returns ENOSPC, no parent entry has been
+        // made visible and create() can safely roll the inode back.
         if child.inode.is_dir() {
-            // let child_ref = child.clone();
             let new_child_ref = Ext4InodeRef {
                 inode_num: child.inode_num,
                 inode: child.inode,
             };
-
-            // at this point child need a new block
-            // Create "." entry pointing to the child directory itself
             self.dir_add_entry(child, &new_child_ref, ".")?;
-
-            // at this point should insert to existing block
-            // Create ".." entry pointing to the parent directory
             self.dir_add_entry(child, parent, "..")?;
+        }
 
+        // Publish the child only after all fallible child initialization has
+        // completed.
+        self.dir_add_entry(parent, child, name)?;
+        self.write_back_inode_without_csum(parent);
+
+        if child.inode.is_dir() {
             child.inode.set_links_count(2);
             let link_cnt = parent.inode.links_count() + 1;
             parent.inode.set_links_count(link_cnt);
@@ -212,12 +211,28 @@ impl Ext4 {
         // load new
         let mut child_inode_ref = self.get_inode_ref(init_child_ref.inode_num);
 
-        self.link(&mut parent_inode_ref, &mut child_inode_ref, name)?;
+        if let Err(error) = self.link(&mut parent_inode_ref, &mut child_inode_ref, name) {
+            self.rollback_unlinked_inode(&mut child_inode_ref);
+            return Err(error);
+        }
 
         self.write_back_inode(&mut parent_inode_ref);
         self.write_back_inode(&mut child_inode_ref);
 
         Ok(child_inode_ref)
+    }
+
+    fn rollback_unlinked_inode(&self, inode_ref: &mut Ext4InodeRef) {
+        if inode_ref.inode.blocks_count() != 0 {
+            if let Err(error) = self.extent_remove_all(inode_ref) {
+                log::error!(
+                    "failed to release blocks for unlinked inode {}: {:?}",
+                    inode_ref.inode_num,
+                    error
+                );
+            }
+        }
+        self.ialloc_free_inode(inode_ref.inode_num, inode_ref.inode.is_dir());
     }
 
     pub fn create_inode(&self, inode_mode: u16) -> Result<Ext4InodeRef> {
@@ -281,7 +296,10 @@ impl Ext4 {
         // load new
         let mut child_inode_ref = self.get_inode_ref(init_child_ref.inode_num);
 
-        self.link(&mut parent_inode_ref, &mut child_inode_ref, name)?;
+        if let Err(error) = self.link(&mut parent_inode_ref, &mut child_inode_ref, name) {
+            self.rollback_unlinked_inode(&mut child_inode_ref);
+            return Err(error);
+        }
 
         self.write_back_inode(&mut parent_inode_ref);
         self.write_back_inode(&mut child_inode_ref);
@@ -373,10 +391,7 @@ impl Ext4 {
                         complete = false;
                         break;
                     }
-                    Err(_) => {
-                        complete = false;
-                        break;
-                    }
+                    Err(error) => return Err(error),
                 }
             }
             if complete && physical_offsets.len() == block_count {
@@ -404,9 +419,7 @@ impl Ext4 {
             let pblock_idx = match self.get_pblock_idx(&inode_ref, iblock as u32) {
                 Ok(idx) => Some(idx),
                 Err(e) if e.error() == Errno::ENOENT => None,
-                Err(_) => {
-                    return_errno_with_message!(Errno::EIO, "Failed to get physical block for logical block");
-                }
+                Err(error) => return Err(error),
             };
 
             if let Some(pblock_idx) = pblock_idx {
@@ -448,9 +461,7 @@ impl Ext4 {
             let pblock_idx = match self.get_pblock_idx(&inode_ref, iblock as u32) {
                 Ok(idx) => Some(idx),
                 Err(e) if e.error() == Errno::ENOENT => None,
-                Err(_) => {
-                    return_errno_with_message!(Errno::EIO, "Failed to get physical block for logical block");
-                }
+                Err(error) => return Err(error),
             };
 
             if let Some(pblock_idx) = pblock_idx {
@@ -590,16 +601,17 @@ impl Ext4 {
             // Get the physical block id
             let pblock_idx = match self.get_pblock_idx(&inode_ref, iblk_idx as u32) {
                 Ok(idx) => idx,
-                Err(e) => {
-                    log::error!("[Write] Failed to get physical block for logical block {}: {:?}", iblk_idx, e);
+                Err(error) if error.error() == Errno::ENOENT => {
+                    log::debug!("[Write] Filling hole at logical block {}", iblk_idx);
                     let allocated = self.allocate_block_for_lblk(&mut inode_ref, iblk_idx as u32)?;
-                    log::error!(
+                    log::debug!(
                         "[Write] Filled hole for logical block {} with physical block {}",
                         iblk_idx,
                         allocated
                     );
                     allocated
                 }
+                Err(error) => return Err(error),
             };
             total_blocks += 1;
 
@@ -625,17 +637,22 @@ impl Ext4 {
             // Get the physical block id
             let pblock_idx = match self.get_pblock_idx(&inode_ref, iblk_idx as u32) {
                 Ok(idx) => idx,
-                Err(e) => {
+                Err(error) if error.error() == Errno::ENOENT => {
                     collect_contiguous_write_run(&mut write_runs, &mut run, write_buf);
                     flush_pending_write_runs(&self.block_device, &mut write_runs);
-                    log::error!("[Write] Failed to get physical block for logical block {}: {:?}", iblk_idx, e);
+                    log::debug!("[Write] Filling hole at logical block {}", iblk_idx);
                     let allocated = self.allocate_block_for_lblk(&mut inode_ref, iblk_idx as u32)?;
-                    log::error!(
+                    log::debug!(
                         "[Write] Filled hole for logical block {} with physical block {}",
                         iblk_idx,
                         allocated
                     );
                     allocated
+                }
+                Err(error) => {
+                    collect_contiguous_write_run(&mut write_runs, &mut run, write_buf);
+                    flush_pending_write_runs(&self.block_device, &mut write_runs);
+                    return Err(error);
                 }
             };
             total_blocks += 1;

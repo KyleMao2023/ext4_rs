@@ -190,15 +190,18 @@ impl Ext4DirEntry {
 
     /// Get the checksum of the directory entry.
     #[allow(unused)]
-    pub fn ext4_dir_get_csum(&self, s: &Ext4Superblock, blk_data: &[u8], ino_gen: u32) -> u32 {
-        let ino_index = self.inode;
-
+    pub fn ext4_dir_get_csum(
+        s: &Ext4Superblock,
+        dir_inode: u32,
+        blk_data: &[u8],
+        ino_gen: u32,
+    ) -> u32 {
         let mut csum = 0;
 
         let uuid = s.uuid;
 
         csum = ext4_crc32c(EXT4_CRC32_INIT, &uuid, uuid.len() as u32);
-        csum = ext4_crc32c(csum, &ino_index.to_le_bytes(), 4);
+        csum = ext4_crc32c(csum, &dir_inode.to_le_bytes(), 4);
         csum = ext4_crc32c(csum, &ino_gen.to_le_bytes(), 4);
         let mut data = [0u8; BLOCK_DATA_SIZE];
         unsafe {
@@ -244,11 +247,11 @@ impl Ext4DirEntryTail{
     pub fn tail_set_csum(
         &mut self,
         s: &Ext4Superblock,
-        diren: &Ext4DirEntry,
+        dir_inode: u32,
         blk_data: &[u8],
         ino_gen: u32,
     ) {
-        let csum = diren.ext4_dir_get_csum(s, blk_data, ino_gen);
+        let csum = Ext4DirEntry::ext4_dir_get_csum(s, dir_inode, blk_data, ino_gen);
         self.checksum = csum;
     }
 

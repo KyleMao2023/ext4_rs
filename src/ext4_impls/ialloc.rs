@@ -123,5 +123,15 @@ impl Ext4 {
 
         super_block.increase_free_inodes_count();
         super_block.sync_to_disk_with_csum(&self.block_device);
+
+        // Once the bitmap no longer references this inode, clear its old mode,
+        // extent root and checksum together.  Leaving a populated inode behind
+        // with either zero dtime or a stale checksum makes e2fsck report a
+        // half-completed deletion.
+        let cleared = Ext4InodeRef {
+            inode_num: index,
+            inode: Ext4Inode::default(),
+        };
+        self.write_back_inode_without_csum(&cleared);
     }
 }

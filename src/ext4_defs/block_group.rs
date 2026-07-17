@@ -54,6 +54,16 @@ impl Ext4BlockGroup {
 }
 
 impl Ext4BlockGroup {
+    /// Return whether a block group descriptor flag is set.
+    pub fn has_flag(&self, flag: u16) -> bool {
+        self.flags & flag != 0
+    }
+
+    /// Clear a block group descriptor flag.
+    pub fn clear_flag(&mut self, flag: u16) {
+        self.flags &= !flag;
+    }
+
     /// Get the block number of the block bitmap for this block group.
     pub fn get_block_bitmap_block(&self, s: &Ext4Superblock) -> u64 {
         let mut v = self.block_bitmap_lo as u64;

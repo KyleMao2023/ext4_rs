@@ -156,13 +156,11 @@ impl Ext4 {
         entries
     }
 
-    pub fn dir_set_csum(&self, dst_blk: &mut Block, ino_gen: u32) {
-        let parent_de: Ext4DirEntry = dst_blk.read_offset_as(0);
-
+    pub fn dir_set_csum(&self, dst_blk: &mut Block, dir_inode: u32, ino_gen: u32) {
         let tail_offset = BLOCK_SIZE - size_of::<Ext4DirEntryTail>();
         let mut tail: Ext4DirEntryTail = *dst_blk.read_offset_as_mut(tail_offset);
 
-        tail.tail_set_csum(&self.super_block, &parent_de, &dst_blk.data[..], ino_gen);
+        tail.tail_set_csum(&self.super_block, dir_inode, &dst_blk.data[..], ino_gen);
 
         tail.copy_to_slice(&mut dst_blk.data);
     }
@@ -211,7 +209,11 @@ impl Ext4 {
 
             if result.is_ok() {
                 // set checksum
-                self.dir_set_csum(&mut ext4block, parent.inode.generation());
+                self.dir_set_csum(
+                    &mut ext4block,
+                    parent.inode_num,
+                    parent.inode.generation(),
+                );
                 ext4block.sync_blk_to_disk(&self.block_device);
 
                 return Ok(EOK);
@@ -233,7 +235,11 @@ impl Ext4 {
         self.insert_to_new_block(&mut new_ext4block, child.inode_num, name, &de_type);
 
         // set checksum
-        self.dir_set_csum(&mut new_ext4block, parent.inode.generation());
+        self.dir_set_csum(
+            &mut new_ext4block,
+            parent.inode_num,
+            parent.inode.generation(),
+        );
         new_ext4block.sync_blk_to_disk(&self.block_device);
 
         Ok(EOK)
@@ -408,7 +414,11 @@ impl Ext4 {
             tmp_de_mut.entry_len = de_len + del_len;
         }
 
-        self.dir_set_csum(&mut ext4block, parent.inode.generation());
+        self.dir_set_csum(
+            &mut ext4block,
+            parent.inode_num,
+            parent.inode.generation(),
+        );
         ext4block.sync_blk_to_disk(&self.block_device);
 
         Ok(EOK)
@@ -490,7 +500,11 @@ impl Ext4 {
         let mut ext4block = Block::load(&self.block_device, result.pblock_id * BLOCK_SIZE);
         let dotdot: &mut Ext4DirEntry = ext4block.read_offset_as_mut(result.offset);
         dotdot.inode = new_parent_inode;
-        self.dir_set_csum(&mut ext4block, dir_ref.inode.generation());
+        self.dir_set_csum(
+            &mut ext4block,
+            dir_ref.inode_num,
+            dir_ref.inode.generation(),
+        );
         ext4block.sync_blk_to_disk(&self.block_device);
         Ok(EOK)
     }

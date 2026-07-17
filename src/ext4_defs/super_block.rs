@@ -169,6 +169,11 @@ impl Ext4Superblock {
         ((self.blocks_count_hi.to_le() as u64) << 32) as u32 | self.blocks_count_lo
     }
 
+    /// Return the full 64-bit filesystem block count.
+    pub fn blocks_count_u64(&self) -> u64 {
+        (self.blocks_count_hi as u64) << 32 | self.blocks_count_lo as u64
+    }
+
     pub fn desc_size(&self) -> u16 {
         let size = self.desc_size;
 

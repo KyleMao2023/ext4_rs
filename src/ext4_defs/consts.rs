@@ -30,7 +30,10 @@ pub const EXT4_EXTENT_SIZE: usize = 12;
 pub const EXT4_EXTENT_INDEX_SIZE: usize = 12;
 pub const MAX_EXTENT_INDEX_COUNT: usize = 340;
 
-/// BLock group descriptor flags.
+/// Block group descriptor flags.
+pub const EXT4_BG_INODE_UNINIT: u16 = 0x0001;
+pub const EXT4_BG_BLOCK_UNINIT: u16 = 0x0002;
+pub const EXT4_BG_INODE_ZEROED: u16 = 0x0004;
 pub const EXT4_MIN_BLOCK_GROUP_DESCRIPTOR_SIZE: u16 = 32;
 pub const EXT4_MAX_BLOCK_GROUP_DESCRIPTOR_SIZE: u16 = 64;
 

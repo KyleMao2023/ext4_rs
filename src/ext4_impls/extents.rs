@@ -5,6 +5,23 @@ use alloc::format;
 use core::mem::size_of;
 use crate::utils::crc::*;
 
+const EXTENT_NODE_MAX_ENTRIES: usize =
+    (BLOCK_SIZE - EXT4_EXTENT_HEADER_SIZE - size_of::<Ext4ExtentTail>()) / EXT4_EXTENT_SIZE;
+
+fn copy_struct_to_slice<T: Copy>(dst: &mut [u8], offset: usize, value: &T) {
+    let bytes = unsafe {
+        core::slice::from_raw_parts(value as *const T as *const u8, size_of::<T>())
+    };
+    dst[offset..offset + bytes.len()].copy_from_slice(bytes);
+}
+
+fn extent_last_block(extent: &Ext4Extent) -> Option<u32> {
+    let len = extent.get_actual_len() as u32;
+    (len != 0)
+        .then(|| extent.first_block.checked_add(len - 1))
+        .flatten()
+}
+
 
 impl Ext4 {
     /// Find an extent in the extent tree.
@@ -24,37 +41,44 @@ impl Ext4 {
         // Load the root node
         let root_data: &[u8; 60] =
             unsafe { core::mem::transmute::<&[u32; 15], &[u8; 60]>(&inode_ref.inode.block) };
-        let mut node = ExtentNode::load_from_data(root_data, true).unwrap();
+        let mut node = ExtentNode::load_from_data(root_data, true)?;
+        self.validate_extent_node_header(&node.header, true)?;
 
         let mut depth = node.header.depth;
 
         // Traverse down the tree if depth > 0
         let mut pblock_of_node = 0;
         while depth > 0 {
-            let index_pos = node.binsearch_idx(lblock);
-            if let Some(pos) = index_pos {
-                let index = node.get_index(pos)?;
-                let next_block = index.get_pblock();
-
-                search_path.path.push(ExtentPathNode {
-                    header: node.header,
-                    index: Some(index),
-                    extent: None,
-                    position: pos,
-                    pblock: next_block,
-                    pblock_of_node,
-                });
-
-                let mut next_data = self
-                    .block_device
-                    .read_offset(next_block as usize * BLOCK_SIZE);
-                node = ExtentNode::load_from_data_mut(&mut next_data, false)?;
-                depth -= 1;
-                search_path.depth += 1;
-                pblock_of_node = next_block as usize;
-            } else {
-                return_errno_with_message!(Errno::ENOENT, "Extentindex not found");
+            // For a lookup before the first index key, descend through the first
+            // child and let the leaf report a hole.  Returning an error here made
+            // it impossible to insert a valid extent before the current first one.
+            let pos = node.binsearch_idx(lblock).unwrap_or(0);
+            let index = node.get_index(pos)?;
+            let next_block = index.get_pblock();
+            if next_block == 0 {
+                return_errno_with_message!(Errno::EIO, "extent index points to block zero");
             }
+
+            search_path.path.push(ExtentPathNode {
+                header: node.header,
+                index: Some(index),
+                extent: None,
+                position: pos,
+                pblock: next_block,
+                pblock_of_node,
+            });
+
+            let mut next_data = self
+                .block_device
+                .read_offset(next_block as usize * BLOCK_SIZE);
+            node = ExtentNode::load_from_data_mut(&mut next_data, false)?;
+            self.validate_extent_node_header(&node.header, false)?;
+            if node.header.depth + 1 != depth {
+                return_errno_with_message!(Errno::EIO, "inconsistent extent tree depth");
+            }
+            depth -= 1;
+            search_path.depth += 1;
+            pblock_of_node = next_block as usize;
         }
 
         // Handle the case where depth is 0
@@ -89,114 +113,481 @@ impl Ext4 {
         inode_ref: &mut Ext4InodeRef,
         newex: &mut Ext4Extent,
     ) -> Result<()> {
-        let newex_first_block = newex.first_block;
-        log::info!("[insert_extent] Starting - Inserting extent at block {}", newex_first_block);
-        log::info!("[insert_extent] Current tree state: magic={:x}, entries={}, max={}, depth={}", 
-            inode_ref.inode.root_extent_header().magic,
-            inode_ref.inode.root_extent_header().entries_count,
-            inode_ref.inode.root_extent_header().max_entries_count,
-            inode_ref.inode.root_extent_header().depth);
-
-        if self.try_merge_appended_extent(inode_ref, newex)? {
-            return Ok(());
-        }
-        
-        let mut search_path = self.find_extent(inode_ref, newex_first_block)?;
-        
-        let depth = search_path.depth as usize;
-        let node = &search_path.path[depth]; // Get the node at the current depth
-
-        let at_root = node.pblock_of_node == 0;
-        let header = node.header;
-
-        // Node is empty (no extents)
-        if header.entries_count == 0 {
-            log::info!("[insert_extent] Node is empty, inserting directly");
-            self.insert_new_extent(inode_ref, &mut search_path, newex)?;
-            return Ok(());
+        if newex.get_actual_len() == 0 || extent_last_block(newex).is_none() {
+            return_errno_with_message!(Errno::EINVAL, "invalid extent range");
         }
 
-        // Insert to exsiting extent
-        if let Some(mut ex) = node.extent {
-            let pos = node.position;
-            let last_extent_pos = header.entries_count as usize - 1;
+        let root_header = inode_ref.inode.root_extent_header();
+        self.validate_extent_node_header(&root_header, true)?;
 
-            // Try to Insert to found_ext
-            // found_ext:   |<---found_ext--->|         |<---ext2--->|
-            //              20              30         50          60
-            // insert:      |<---found_ext---><---newex--->|         |<---ext2--->|
-            //              20              30            40         50          60
-            // merge:       |<---newex--->|      |<---ext2--->|
-            //              20           40      50          60
-            if self.can_merge(&ex, newex) {
-                self.merge_extent(&search_path, &mut ex, newex)?;
-
-                if at_root {
-                    // we are at root
-                    *inode_ref.inode.root_extent_mut_at(node.position) = ex;
-                }
+        if root_header.depth == 0 {
+            let mut extents = self.root_extents(inode_ref)?;
+            self.insert_extent_entry(&mut extents, *newex)?;
+            if extents.len() <= root_header.max_entries_count as usize {
+                self.write_root_extents(inode_ref, &extents);
                 return Ok(());
             }
 
-            // Insert right
-            // found_ext:   |<---found_ext--->|         |<---next_extent--->|
-            //              10               20         30                40
-            // insert:      |<---found_ext--->|<---newex---><---next_extent--->|
-            //              10               20            30                40
-            // merge:       |<---found_ext--->|<---newex--->|
-            //              10               20            40
-            if pos < last_extent_pos
-                && ((ex.first_block + ex.block_count as u32) < newex.first_block)
+            // A root leaf has room for only four extents.  Move all entries to
+            // one external leaf and turn the inode root into an index node.
+            let blocks = self.reserve_extent_metadata_blocks(inode_ref, 1)?;
+            let leaf_block = blocks[0];
+            self.write_extent_leaf(inode_ref, leaf_block, &extents)?;
+            let mut index = Ext4ExtentIndex::default();
+            index.first_block = extents[0].first_block;
+            index.store_pblock(leaf_block);
+            self.write_root_indexes(inode_ref, 1, &[index]);
+            return Ok(());
+        }
+
+        let search_path = self.find_extent(inode_ref, newex.first_block)?;
+        let depth = search_path.depth as usize;
+        if depth == 0 || search_path.path.len() != depth + 1 {
+            return_errno_with_message!(Errno::EIO, "invalid extent search path");
+        }
+
+        let leaf_block = search_path.path[depth].pblock_of_node as Ext4Fsblk;
+        let mut extents = self.read_extent_leaf(leaf_block)?;
+        self.insert_extent_entry(&mut extents, *newex)?;
+
+        if extents.len() <= EXTENT_NODE_MAX_ENTRIES {
+            let first_block = extents[0].first_block;
+            self.write_extent_leaf(inode_ref, leaf_block, &extents)?;
+            self.update_ancestor_first_blocks(inode_ref, &search_path, depth, first_block)?;
+            return Ok(());
+        }
+
+        // Validate every parent and path edge before reserving blocks.  From
+        // this point onward the block-device API cannot report write failures,
+        // so the split commit has no fallible metadata lookup in its middle.
+        for level in 0..depth {
+            let indexes = self.read_indexes_at_level(inode_ref, &search_path, level)?;
+            let child_pos = search_path.path[level].position;
+            if child_pos >= indexes.len()
+                || indexes[child_pos].get_pblock()
+                    != search_path.path[level + 1].pblock_of_node as u64
             {
-                if let Ok(next_extent) = self.get_extent_from_node(inode_ref, node, pos + 1) {
-                    if self.can_merge(&next_extent, newex) {
-                        self.merge_extent(&search_path, newex, &next_extent)?;
-                        return Ok(());
-                    }
-                }
-            }
-
-            // Insert left
-            //  found_ext:  |<---found_ext--->|         |<---ext2--->|
-            //              20              30         40          50
-            // insert:   |<---prev_extent---><---newex--->|<---found_ext--->|....|<---ext2--->|
-            //           0                  10          20                 30    40          50
-            // merge:    |<---newex--->|<---found_ext--->|....|<---ext2--->|
-            //           0            20                30    40          50
-            if pos > 0 && (newex.first_block + newex.block_count as u32) < ex.first_block {
-                if let Ok(mut prev_extent) = self.get_extent_from_node(inode_ref, node, pos - 1) {
-                    if self.can_merge(&prev_extent, newex) {
-                        self.merge_extent(&search_path, &mut prev_extent, newex)?;
-                        return Ok(());
-                    }
-                }
+                return_errno_with_message!(Errno::EIO, "invalid extent path edge");
             }
         }
 
-        // Check if there's space to insert the new extent
-        //                full         full
-        // Before:   |<---ext1--->|<---ext2--->|
-        //           10           20          30
+        // Work out every metadata block needed by the split before modifying
+        // the existing tree.  If ENOSPC is hit, all reservations are rolled
+        // back and the old tree remains untouched.
+        let mut blocks_needed = 1; // right sibling of the leaf
+        for level in (0..depth).rev() {
+            let header = search_path.path[level].header;
+            if header.entries_count < header.max_entries_count {
+                break;
+            }
+            blocks_needed += 1; // sibling index block, or a block for root growth
+        }
+        let reserved = self.reserve_extent_metadata_blocks(inode_ref, blocks_needed)?;
+        let mut next_reserved = 0usize;
 
-        //                full          full
-        // insert:   |<---ext1--->|<---ext2--->|<---newex--->|
-        //           10           20           30           35
-        if header.entries_count < header.max_entries_count {
-            log::info!("[insert_extent] Node has space, inserting new extent");
-            self.insert_new_extent(inode_ref, &mut search_path, newex)?;
-        } else {
-            log::info!("[insert_extent] Node is full (entries={}, max={}), creating new leaf", 
-                header.entries_count, header.max_entries_count);
-            self.create_new_leaf(inode_ref, &mut search_path, newex)?;
+        let right_leaf_block = reserved[next_reserved];
+        next_reserved += 1;
+        let right_extents = extents.split_off(extents.len() / 2);
+        let mut child_first = extents[0].first_block;
+        self.write_extent_leaf(inode_ref, leaf_block, &extents)?;
+        self.write_extent_leaf(inode_ref, right_leaf_block, &right_extents)?;
+
+        let mut carry = Ext4ExtentIndex::default();
+        carry.first_block = right_extents[0].first_block;
+        carry.store_pblock(right_leaf_block);
+
+        for level in (0..depth).rev() {
+            let child_pos = search_path.path[level].position;
+            let mut indexes = self.read_indexes_at_level(inode_ref, &search_path, level)?;
+            if child_pos >= indexes.len() {
+                return_errno_with_message!(Errno::EIO, "extent parent position is out of range");
+            }
+            indexes[child_pos].first_block = child_first;
+            indexes.insert(child_pos + 1, carry);
+
+            let capacity = search_path.path[level].header.max_entries_count as usize;
+            if indexes.len() <= capacity {
+                let parent_first = indexes[0].first_block;
+                self.write_indexes_at_level(inode_ref, &search_path, level, &indexes)?;
+                self.update_ancestor_first_blocks(
+                    inode_ref,
+                    &search_path,
+                    level,
+                    parent_first,
+                )?;
+                debug_assert_eq!(next_reserved, reserved.len());
+                return Ok(());
+            }
+
+            let new_index_block = reserved[next_reserved];
+            next_reserved += 1;
+            if level == 0 {
+                // The inode root cannot be split in place.  Move its entries to
+                // an external index block and make a one-entry root above it.
+                let old_depth = search_path.path[0].header.depth;
+                self.write_extent_indexes(inode_ref, new_index_block, old_depth, &indexes)?;
+                let mut root_index = Ext4ExtentIndex::default();
+                root_index.first_block = indexes[0].first_block;
+                root_index.store_pblock(new_index_block);
+                self.write_root_indexes(inode_ref, old_depth + 1, &[root_index]);
+                debug_assert_eq!(next_reserved, reserved.len());
+                return Ok(());
+            }
+
+            let right_indexes = indexes.split_off(indexes.len() / 2);
+            child_first = indexes[0].first_block;
+            let node_depth = search_path.path[level].header.depth;
+            let old_index_block = search_path.path[level].pblock_of_node as Ext4Fsblk;
+            self.write_extent_indexes(inode_ref, old_index_block, node_depth, &indexes)?;
+            self.write_extent_indexes(inode_ref, new_index_block, node_depth, &right_indexes)?;
+
+            carry = Ext4ExtentIndex::default();
+            carry.first_block = right_indexes[0].first_block;
+            carry.store_pblock(new_index_block);
         }
 
-        log::info!("[insert_extent] Completed - Final tree state: magic={:x}, entries={}, max={}, depth={}", 
-            inode_ref.inode.root_extent_header().magic,
-            inode_ref.inode.root_extent_header().entries_count,
-            inode_ref.inode.root_extent_header().max_entries_count,
-            inode_ref.inode.root_extent_header().depth);
+        return_errno_with_message!(Errno::EIO, "failed to propagate extent split")
+    }
 
+    fn validate_extent_node_header(&self, header: &Ext4ExtentHeader, is_root: bool) -> Result<()> {
+        let max_allowed = if is_root { 4 } else { EXTENT_NODE_MAX_ENTRIES };
+        if header.magic != EXT4_EXTENT_MAGIC
+            || header.max_entries_count == 0
+            || header.max_entries_count as usize > max_allowed
+            || header.entries_count > header.max_entries_count
+        {
+            return_errno_with_message!(Errno::EIO, "corrupt extent node header");
+        }
         Ok(())
+    }
+
+    fn validate_extent_entries(&self, extents: &[Ext4Extent]) -> Result<()> {
+        let mut previous_last = None;
+        for extent in extents {
+            let Some(last) = extent_last_block(extent) else {
+                return_errno_with_message!(Errno::EIO, "corrupt extent range");
+            };
+            if let Some(previous_last) = previous_last {
+                if extent.first_block <= previous_last {
+                    return_errno_with_message!(Errno::EIO, "overlapping extents");
+                }
+            }
+            previous_last = Some(last);
+        }
+        Ok(())
+    }
+
+    fn insert_extent_entry(
+        &self,
+        extents: &mut Vec<Ext4Extent>,
+        new_extent: Ext4Extent,
+    ) -> Result<()> {
+        self.validate_extent_entries(extents)?;
+        let Some(new_last) = extent_last_block(&new_extent) else {
+            return_errno_with_message!(Errno::EINVAL, "invalid extent range");
+        };
+        let mut pos = 0;
+        while pos < extents.len() && extents[pos].first_block < new_extent.first_block {
+            pos += 1;
+        }
+        if pos > 0 && extent_last_block(&extents[pos - 1]).unwrap() >= new_extent.first_block {
+            return_errno_with_message!(Errno::EINVAL, "new extent overlaps previous extent");
+        }
+        if pos < extents.len() && new_last >= extents[pos].first_block {
+            return_errno_with_message!(Errno::EINVAL, "new extent overlaps next extent");
+        }
+
+        extents.insert(pos, new_extent);
+        if pos > 0 && self.can_merge(&extents[pos - 1], &extents[pos]) {
+            let right = extents.remove(pos);
+            let left = &mut extents[pos - 1];
+            let unwritten = left.is_unwritten();
+            left.set_actual_len(left.get_actual_len() + right.get_actual_len());
+            if unwritten {
+                left.mark_unwritten();
+            }
+            pos -= 1;
+        }
+        if pos + 1 < extents.len() && self.can_merge(&extents[pos], &extents[pos + 1]) {
+            let right = extents.remove(pos + 1);
+            let left = &mut extents[pos];
+            let unwritten = left.is_unwritten();
+            left.set_actual_len(left.get_actual_len() + right.get_actual_len());
+            if unwritten {
+                left.mark_unwritten();
+            }
+        }
+        Ok(())
+    }
+
+    fn root_extents(&self, inode_ref: &mut Ext4InodeRef) -> Result<Vec<Ext4Extent>> {
+        let header = inode_ref.inode.root_extent_header();
+        self.validate_extent_node_header(&header, true)?;
+        if header.depth != 0 {
+            return_errno_with_message!(Errno::EIO, "extent root is not a leaf");
+        }
+        let mut extents = Vec::with_capacity(header.entries_count as usize);
+        for pos in 0..header.entries_count as usize {
+            extents.push(inode_ref.inode.root_extent_at(pos));
+        }
+        self.validate_extent_entries(&extents)?;
+        Ok(extents)
+    }
+
+    fn root_indexes(&self, inode_ref: &Ext4InodeRef) -> Result<Vec<Ext4ExtentIndex>> {
+        let header = inode_ref.inode.root_extent_header();
+        self.validate_extent_node_header(&header, true)?;
+        if header.depth == 0 {
+            return_errno_with_message!(Errno::EIO, "extent root is not an index node");
+        }
+        let data: &[u8; 60] =
+            unsafe { core::mem::transmute::<&[u32; 15], &[u8; 60]>(&inode_ref.inode.block) };
+        let mut indexes = Vec::with_capacity(header.entries_count as usize);
+        for pos in 0..header.entries_count as usize {
+            indexes.push(Ext4ExtentIndex::load_from_u8(
+                &data[EXT4_EXTENT_HEADER_SIZE + pos * EXT4_EXTENT_INDEX_SIZE..],
+            ));
+        }
+        self.validate_extent_indexes(&indexes)?;
+        Ok(indexes)
+    }
+
+    fn validate_extent_indexes(&self, indexes: &[Ext4ExtentIndex]) -> Result<()> {
+        for (pos, index) in indexes.iter().enumerate() {
+            if index.get_pblock() == 0
+                || (pos > 0 && index.first_block <= indexes[pos - 1].first_block)
+            {
+                return_errno_with_message!(Errno::EIO, "corrupt extent indexes");
+            }
+        }
+        Ok(())
+    }
+
+    fn read_extent_leaf(&self, block: Ext4Fsblk) -> Result<Vec<Ext4Extent>> {
+        let node = Block::load(&self.block_device, block as usize * BLOCK_SIZE);
+        if node.data.len() != BLOCK_SIZE {
+            return_errno_with_message!(Errno::EIO, "short extent leaf read");
+        }
+        let header: Ext4ExtentHeader = node.read_offset_as(0);
+        self.validate_extent_node_header(&header, false)?;
+        if header.depth != 0 {
+            return_errno_with_message!(Errno::EIO, "extent leaf has non-zero depth");
+        }
+        let mut extents = Vec::with_capacity(header.entries_count as usize);
+        for pos in 0..header.entries_count as usize {
+            extents.push(node.read_offset_as(
+                EXT4_EXTENT_HEADER_SIZE + pos * EXT4_EXTENT_SIZE,
+            ));
+        }
+        self.validate_extent_entries(&extents)?;
+        Ok(extents)
+    }
+
+    fn read_extent_indexes(&self, block: Ext4Fsblk, expected_depth: u16) -> Result<Vec<Ext4ExtentIndex>> {
+        let node = Block::load(&self.block_device, block as usize * BLOCK_SIZE);
+        if node.data.len() != BLOCK_SIZE {
+            return_errno_with_message!(Errno::EIO, "short extent index read");
+        }
+        let header: Ext4ExtentHeader = node.read_offset_as(0);
+        self.validate_extent_node_header(&header, false)?;
+        if header.depth != expected_depth || header.depth == 0 {
+            return_errno_with_message!(Errno::EIO, "inconsistent extent index depth");
+        }
+        let mut indexes = Vec::with_capacity(header.entries_count as usize);
+        for pos in 0..header.entries_count as usize {
+            indexes.push(node.read_offset_as(
+                EXT4_EXTENT_HEADER_SIZE + pos * EXT4_EXTENT_INDEX_SIZE,
+            ));
+        }
+        self.validate_extent_indexes(&indexes)?;
+        Ok(indexes)
+    }
+
+    fn write_root_extents(&self, inode_ref: &mut Ext4InodeRef, extents: &[Ext4Extent]) {
+        inode_ref.inode.block.fill(0);
+        *inode_ref.inode.root_extent_header_mut() =
+            Ext4ExtentHeader::new(EXT4_EXTENT_MAGIC, extents.len() as u16, 4, 0, 0);
+        for (pos, extent) in extents.iter().enumerate() {
+            *inode_ref.inode.root_extent_mut_at(pos) = *extent;
+        }
+        self.write_back_inode(inode_ref);
+    }
+
+    fn write_root_indexes(
+        &self,
+        inode_ref: &mut Ext4InodeRef,
+        depth: u16,
+        indexes: &[Ext4ExtentIndex],
+    ) {
+        inode_ref.inode.block.fill(0);
+        let data: &mut [u8; 60] = unsafe {
+            core::mem::transmute::<&mut [u32; 15], &mut [u8; 60]>(&mut inode_ref.inode.block)
+        };
+        let header = Ext4ExtentHeader::new(
+            EXT4_EXTENT_MAGIC,
+            indexes.len() as u16,
+            4,
+            depth,
+            0,
+        );
+        copy_struct_to_slice(data, 0, &header);
+        for (pos, index) in indexes.iter().enumerate() {
+            copy_struct_to_slice(
+                data,
+                EXT4_EXTENT_HEADER_SIZE + pos * EXT4_EXTENT_INDEX_SIZE,
+                index,
+            );
+        }
+        self.write_back_inode(inode_ref);
+    }
+
+    fn write_extent_leaf(
+        &self,
+        inode_ref: &Ext4InodeRef,
+        block: Ext4Fsblk,
+        extents: &[Ext4Extent],
+    ) -> Result<()> {
+        let mut node = Block::load(&self.block_device, block as usize * BLOCK_SIZE);
+        if node.data.len() != BLOCK_SIZE || extents.is_empty() || extents.len() > EXTENT_NODE_MAX_ENTRIES {
+            return_errno_with_message!(Errno::EIO, "invalid extent leaf write");
+        }
+        node.data.fill(0);
+        let header = Ext4ExtentHeader::new(
+            EXT4_EXTENT_MAGIC,
+            extents.len() as u16,
+            EXTENT_NODE_MAX_ENTRIES as u16,
+            0,
+            0,
+        );
+        copy_struct_to_slice(&mut node.data, 0, &header);
+        for (pos, extent) in extents.iter().enumerate() {
+            copy_struct_to_slice(
+                &mut node.data,
+                EXT4_EXTENT_HEADER_SIZE + pos * EXT4_EXTENT_SIZE,
+                extent,
+            );
+        }
+        node.sync_blk_to_disk(&self.block_device);
+        self.set_extent_block_checksum(inode_ref, block as usize)
+    }
+
+    fn write_extent_indexes(
+        &self,
+        inode_ref: &Ext4InodeRef,
+        block: Ext4Fsblk,
+        depth: u16,
+        indexes: &[Ext4ExtentIndex],
+    ) -> Result<()> {
+        let mut node = Block::load(&self.block_device, block as usize * BLOCK_SIZE);
+        if node.data.len() != BLOCK_SIZE
+            || depth == 0
+            || indexes.is_empty()
+            || indexes.len() > EXTENT_NODE_MAX_ENTRIES
+        {
+            return_errno_with_message!(Errno::EIO, "invalid extent index write");
+        }
+        node.data.fill(0);
+        let header = Ext4ExtentHeader::new(
+            EXT4_EXTENT_MAGIC,
+            indexes.len() as u16,
+            EXTENT_NODE_MAX_ENTRIES as u16,
+            depth,
+            0,
+        );
+        copy_struct_to_slice(&mut node.data, 0, &header);
+        for (pos, index) in indexes.iter().enumerate() {
+            copy_struct_to_slice(
+                &mut node.data,
+                EXT4_EXTENT_HEADER_SIZE + pos * EXT4_EXTENT_INDEX_SIZE,
+                index,
+            );
+        }
+        node.sync_blk_to_disk(&self.block_device);
+        self.set_extent_block_checksum(inode_ref, block as usize)
+    }
+
+    fn read_indexes_at_level(
+        &self,
+        inode_ref: &Ext4InodeRef,
+        search_path: &SearchPath,
+        level: usize,
+    ) -> Result<Vec<Ext4ExtentIndex>> {
+        if level == 0 {
+            self.root_indexes(inode_ref)
+        } else {
+            self.read_extent_indexes(
+                search_path.path[level].pblock_of_node as Ext4Fsblk,
+                search_path.path[level].header.depth,
+            )
+        }
+    }
+
+    fn write_indexes_at_level(
+        &self,
+        inode_ref: &mut Ext4InodeRef,
+        search_path: &SearchPath,
+        level: usize,
+        indexes: &[Ext4ExtentIndex],
+    ) -> Result<()> {
+        if level == 0 {
+            self.write_root_indexes(inode_ref, search_path.path[0].header.depth, indexes);
+            Ok(())
+        } else {
+            self.write_extent_indexes(
+                inode_ref,
+                search_path.path[level].pblock_of_node as Ext4Fsblk,
+                search_path.path[level].header.depth,
+                indexes,
+            )
+        }
+    }
+
+    fn update_ancestor_first_blocks(
+        &self,
+        inode_ref: &mut Ext4InodeRef,
+        search_path: &SearchPath,
+        mut child_level: usize,
+        mut first_block: u32,
+    ) -> Result<()> {
+        while child_level > 0 {
+            let parent_level = child_level - 1;
+            let child_pos = search_path.path[parent_level].position;
+            let mut indexes = self.read_indexes_at_level(inode_ref, search_path, parent_level)?;
+            if child_pos >= indexes.len() {
+                return_errno_with_message!(Errno::EIO, "extent parent position is out of range");
+            }
+            if indexes[child_pos].first_block == first_block {
+                break;
+            }
+            indexes[child_pos].first_block = first_block;
+            first_block = indexes[0].first_block;
+            self.write_indexes_at_level(inode_ref, search_path, parent_level, &indexes)?;
+            if child_pos != 0 {
+                break;
+            }
+            child_level = parent_level;
+        }
+        Ok(())
+    }
+
+    fn reserve_extent_metadata_blocks(
+        &self,
+        inode_ref: &mut Ext4InodeRef,
+        count: usize,
+    ) -> Result<Vec<Ext4Fsblk>> {
+        let mut blocks = Vec::with_capacity(count);
+        for _ in 0..count {
+            match self.balloc_alloc_block(inode_ref, None) {
+                Ok(block) => blocks.push(block),
+                Err(error) => {
+                    for block in blocks {
+                        self.balloc_free_blocks(inode_ref, block, 1);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(blocks)
     }
 
     fn try_merge_appended_extent(
@@ -902,43 +1293,15 @@ impl Ext4 {
             root_header.depth,
             root_header.entries_count
         );
-        match root_header.depth {
-            0 => {
-                for pos in 0..root_header.entries_count as usize {
-                    let ex = inode_ref.inode.root_extent_at(pos);
-                    self.ext_remove_extent_blocks(inode_ref, ex);
-                }
+        if root_header.depth == 0 {
+            let extents = self.root_extents(inode_ref)?;
+            for extent in extents {
+                self.ext_remove_extent_blocks(inode_ref, extent);
             }
-            1 => {
-                for pos in 0..root_header.entries_count as usize {
-                    let index = {
-                        let root_data = unsafe {
-                            core::mem::transmute::<&[u32; 15], &[u8; 60]>(&inode_ref.inode.block)
-                        };
-                        let node = ExtentNode::load_from_data(root_data, true)?;
-                        node.get_index(pos)?
-                    };
-                    let leaf_block = index.get_pblock();
-                    let leaf = Block::load(&self.block_device, leaf_block as usize * BLOCK_SIZE);
-                    let leaf_header: Ext4ExtentHeader = leaf.read_offset_as(0);
-                    for ext_pos in 0..leaf_header.entries_count as usize {
-                        let ex: Ext4Extent = leaf.read_offset_as(
-                            size_of::<Ext4ExtentHeader>() + ext_pos * size_of::<Ext4Extent>(),
-                        );
-                        self.ext_remove_extent_blocks(inode_ref, ex);
-                    }
-                    // 释放叶子 extent 节点本身。
-                    self.balloc_free_blocks(inode_ref, leaf_block as _, 1);
-                }
-            }
-            _ => {
-                log::error!(
-                    "[extent_remove_all] unsupported extent depth: ino={} depth={}",
-                    inode_ref.inode_num,
-                    root_header.depth
-                );
-                // TODO：补齐 depth>1 时的递归 index/leaf 释放。
-                return_errno_with_message!(Errno::ENOTSUP, "extent remove all for depth > 1 is not implemented");
+        } else {
+            let indexes = self.root_indexes(inode_ref)?;
+            for index in indexes {
+                self.extent_free_subtree(inode_ref, index.get_pblock(), root_header.depth - 1)?;
             }
         }
 
@@ -948,6 +1311,27 @@ impl Ext4 {
         self.write_back_inode(inode_ref);
         log::debug!("[extent_remove_all] completed: ino={}", inode_ref.inode_num);
         Ok(EOK)
+    }
+
+    fn extent_free_subtree(
+        &self,
+        inode_ref: &mut Ext4InodeRef,
+        block: Ext4Fsblk,
+        depth: u16,
+    ) -> Result<()> {
+        if depth == 0 {
+            let extents = self.read_extent_leaf(block)?;
+            for extent in extents {
+                self.ext_remove_extent_blocks(inode_ref, extent);
+            }
+        } else {
+            let indexes = self.read_extent_indexes(block, depth)?;
+            for index in indexes {
+                self.extent_free_subtree(inode_ref, index.get_pblock(), depth - 1)?;
+            }
+        }
+        self.balloc_free_blocks(inode_ref, block, 1);
+        Ok(())
     }
 
     /// 释放单个 extent 覆盖的数据块。
