@@ -45,6 +45,8 @@ pub struct Ext4FakeDirEntry {
     inode_type: u8,
 }
 
+pub const EXT4_DIR_ENTRY_HEADER_SIZE: usize = core::mem::size_of::<Ext4FakeDirEntry>();
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Ext4DirEntryTail {
@@ -55,13 +57,13 @@ pub struct Ext4DirEntryTail {
     pub checksum: u32, // crc32c(uuid+inum+dirblock)
 }
 
-pub struct Ext4DirSearchResult{
-    pub dentry: Ext4DirEntry, 
-    pub pblock_id: usize, // disk block id
-    pub blocks_scanned: usize, // directory blocks scanned during lookup
+pub struct Ext4DirSearchResult {
+    pub dentry: Ext4DirEntry,
+    pub pblock_id: usize,       // disk block id
+    pub blocks_scanned: usize,  // directory blocks scanned during lookup
     pub dirents_scanned: usize, // directory entries examined during lookup
-    pub offset: usize, // offset in block
-    pub prev_offset: usize, //prev direntry offset
+    pub offset: usize,          // offset in block
+    pub prev_offset: usize,     //prev direntry offset
 }
 
 impl Ext4DirSearchResult {
@@ -109,16 +111,55 @@ impl Default for Ext4DirEntry {
     }
 }
 
-impl<T> TryFrom<&[T]> for Ext4DirEntry {
-    type Error = u64;
-    fn try_from(data: &[T]) -> core::result::Result<Self, u64> {
-        // let data = data;
-        Ok(unsafe { core::ptr::read(data.as_ptr() as *const _) })
+impl TryFrom<&[u8]> for Ext4DirEntry {
+    type Error = Ext4Error;
+
+    fn try_from(data: &[u8]) -> Result<Self> {
+        if data.len() < EXT4_DIR_ENTRY_HEADER_SIZE {
+            return Err(Ext4Error::with_message(
+                Errno::EIO,
+                "Short ext4 directory entry header",
+            ));
+        }
+
+        let entry_len = u16::from_le_bytes([data[4], data[5]]) as usize;
+        let name_len = data[6] as usize;
+        if entry_len < EXT4_DIR_ENTRY_HEADER_SIZE
+            || entry_len % 4 != 0
+            || entry_len > data.len()
+            || name_len > entry_len - EXT4_DIR_ENTRY_HEADER_SIZE
+        {
+            return Err(Ext4Error::with_message(
+                Errno::EIO,
+                "Invalid ext4 directory entry",
+            ));
+        }
+
+        let mut entry = Self::default();
+        entry.inode = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        entry.entry_len = entry_len as u16;
+        entry.name_len = name_len as u8;
+        entry.inner.inode_type = data[7];
+        entry.name[..name_len].copy_from_slice(
+            &data[EXT4_DIR_ENTRY_HEADER_SIZE..EXT4_DIR_ENTRY_HEADER_SIZE + name_len],
+        );
+        Ok(entry)
     }
 }
 
 /// Directory entry implementation.
 impl Ext4DirEntry {
+    /// Parse one variable-length on-disk directory record.  `data_end` is the
+    /// end of the directory payload and excludes the checksum tail.
+    pub fn from_slice_at(data: &[u8], offset: usize, data_end: usize) -> Result<Self> {
+        if data_end > data.len() || offset > data_end {
+            return Err(Ext4Error::with_message(
+                Errno::EIO,
+                "Invalid ext4 directory block bounds",
+            ));
+        }
+        Self::try_from(&data[offset..data_end])
+    }
 
     /// Check if the directory entry is unused.
     pub fn unused(&self) -> bool {
@@ -132,8 +173,8 @@ impl Ext4DirEntry {
 
     /// Check name
     pub fn compare_name(&self, name: &str) -> bool {
-        if self.name_len as usize == name.len(){
-            return &self.name[..name.len()] == name.as_bytes()
+        if self.name_len as usize == name.len() {
+            return &self.name[..name.len()] == name.as_bytes();
         }
         false
     }
@@ -165,7 +206,7 @@ impl Ext4DirEntry {
     pub fn actual_len(&self) -> usize {
         size_of::<Ext4FakeDirEntry>() + self.name_len as usize
     }
-    
+
     /// Calculate the aligned length of a directory entry (including padding bytes)
     pub fn align_len(&self) -> usize {
         let mut len = self.actual_len();
@@ -173,21 +214,35 @@ impl Ext4DirEntry {
         len
     }
 
-    pub fn write_entry(&mut self, entry_len: u16, inode: u32, name: &str, de_type:&DirEntryType) {
+    pub fn write_entry(
+        &mut self,
+        entry_len: u16,
+        inode: u32,
+        name: &str,
+        de_type: &DirEntryType,
+    ) -> Result<()> {
+        if name.len() > self.name.len()
+            || EXT4_DIR_ENTRY_HEADER_SIZE + name.len() > entry_len as usize
+        {
+            return Err(Ext4Error::with_message(
+                Errno::ENAMETOOLONG,
+                "Invalid ext4 directory entry name",
+            ));
+        }
         self.inode = inode;
         self.entry_len = entry_len;
         self.name_len = name.len() as u8;
         self.inner.inode_type = de_type.bits();
+        self.name.fill(0);
         self.name[..name.len()].copy_from_slice(name.as_bytes());
+        Ok(())
     }
-
 }
 
 /// The size of a block without its tail
 const BLOCK_DATA_SIZE: usize = BLOCK_SIZE - core::mem::size_of::<Ext4DirEntryTail>();
 
 impl Ext4DirEntry {
-
     /// Get the checksum of the directory entry.
     #[allow(unused)]
     pub fn ext4_dir_get_csum(
@@ -214,27 +269,85 @@ impl Ext4DirEntry {
 
     /// Write de to block
     pub fn write_de_to_blk(&self, dst_blk: &mut Block, offset: usize) {
-        let count = core::mem::size_of::<Ext4DirEntry>() / core::mem::size_of::<u8>();
-        let data = unsafe { core::slice::from_raw_parts(self as *const _ as *const u8, count) };
-        dst_blk.data.splice(
-            offset..offset + core::mem::size_of::<Ext4DirEntry>(),
-            data.iter().cloned(),
-        );
-        // assert_eq!(dst_blk.block_data[offset..offset + core::mem::size_of::<Ext4DirEntry>()], data[..]);
+        self.copy_to_slice(&mut dst_blk.data, offset)
+            .expect("invalid ext4 directory entry write");
     }
 
-    /// Copy the directory entry to a slice.
-    pub fn copy_to_slice(&self, array: &mut [u8], offset: usize) {
-        let de_ptr = self as *const Ext4DirEntry as *const u8;
-        let array_ptr = array as *mut [u8] as *mut u8;
-        let count = core::mem::size_of::<Ext4DirEntry>() / core::mem::size_of::<u8>();
-        unsafe {
-            core::ptr::copy_nonoverlapping(de_ptr, array_ptr.add(offset), count);
+    /// Serialize only the fixed header and the actual name.  The in-memory
+    /// structure contains a 255-byte name buffer, but an ext4 directory block
+    /// stores variable-length records and must never be accessed as that full
+    /// structure.
+    pub fn copy_to_slice(&self, array: &mut [u8], offset: usize) -> Result<()> {
+        let name_len = self.name_len as usize;
+        let record_len = self.entry_len as usize;
+        let actual_len = EXT4_DIR_ENTRY_HEADER_SIZE + name_len;
+        let Some(record_end) = offset.checked_add(record_len) else {
+            return Err(Ext4Error::with_message(
+                Errno::EIO,
+                "Ext4 directory entry write overflow",
+            ));
+        };
+        if record_len < EXT4_DIR_ENTRY_HEADER_SIZE
+            || record_len % 4 != 0
+            || actual_len > record_len
+            || record_end > array.len()
+        {
+            return Err(Ext4Error::with_message(
+                Errno::EIO,
+                "Invalid ext4 directory entry write",
+            ));
         }
+        array[offset..offset + 4].copy_from_slice(&self.inode.to_le_bytes());
+        array[offset + 4..offset + 6].copy_from_slice(&self.entry_len.to_le_bytes());
+        array[offset + 6] = self.name_len;
+        array[offset + 7] = self.get_de_type();
+        array[offset + EXT4_DIR_ENTRY_HEADER_SIZE..offset + actual_len]
+            .copy_from_slice(&self.name[..name_len]);
+        Ok(())
+    }
+
+    pub fn set_inode_in_slice(array: &mut [u8], offset: usize, inode: u32) -> Result<()> {
+        let Some(end) = offset.checked_add(4) else {
+            return Err(Ext4Error::with_message(
+                Errno::EIO,
+                "Invalid directory offset",
+            ));
+        };
+        let Some(field) = array.get_mut(offset..end) else {
+            return Err(Ext4Error::with_message(
+                Errno::EIO,
+                "Invalid directory offset",
+            ));
+        };
+        field.copy_from_slice(&inode.to_le_bytes());
+        Ok(())
+    }
+
+    pub fn set_entry_len_in_slice(array: &mut [u8], offset: usize, entry_len: u16) -> Result<()> {
+        let Some(start) = offset.checked_add(4) else {
+            return Err(Ext4Error::with_message(
+                Errno::EIO,
+                "Invalid directory offset",
+            ));
+        };
+        let Some(end) = start.checked_add(2) else {
+            return Err(Ext4Error::with_message(
+                Errno::EIO,
+                "Invalid directory offset",
+            ));
+        };
+        let Some(field) = array.get_mut(start..end) else {
+            return Err(Ext4Error::with_message(
+                Errno::EIO,
+                "Invalid directory offset",
+            ));
+        };
+        field.copy_from_slice(&entry_len.to_le_bytes());
+        Ok(())
     }
 }
 
-impl Ext4DirEntryTail{
+impl Ext4DirEntryTail {
     pub fn new() -> Self {
         Self {
             reserved_zero1: 0,
@@ -257,11 +370,60 @@ impl Ext4DirEntryTail{
 
     pub fn copy_to_slice(&self, array: &mut [u8]) {
         unsafe {
-        let offset = BLOCK_SIZE - core::mem::size_of::<Ext4DirEntryTail>();
-        let de_ptr = self as *const Ext4DirEntryTail as *const u8;
-        let array_ptr = array as *mut [u8] as *mut u8;
-        let count = core::mem::size_of::<Ext4DirEntryTail>();
+            let offset = BLOCK_SIZE - core::mem::size_of::<Ext4DirEntryTail>();
+            let de_ptr = self as *const Ext4DirEntryTail as *const u8;
+            let array_ptr = array as *mut [u8] as *mut u8;
+            let count = core::mem::size_of::<Ext4DirEntryTail>();
             core::ptr::copy_nonoverlapping(de_ptr, array_ptr.add(offset), count);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_variable_record_near_block_end() {
+        let mut block = vec![0u8; BLOCK_SIZE];
+        let offset = 0xf04;
+        let record_len = 40u16;
+        let name = b"1234567890123456789012345678901";
+        block[offset..offset + 4].copy_from_slice(&42u32.to_le_bytes());
+        block[offset + 4..offset + 6].copy_from_slice(&record_len.to_le_bytes());
+        block[offset + 6] = name.len() as u8;
+        block[offset + 7] = DirEntryType::EXT4_DE_REG_FILE.bits();
+        block
+            [offset + EXT4_DIR_ENTRY_HEADER_SIZE..offset + EXT4_DIR_ENTRY_HEADER_SIZE + name.len()]
+            .copy_from_slice(name);
+
+        let entry =
+            Ext4DirEntry::from_slice_at(&block, offset, BLOCK_SIZE - size_of::<Ext4DirEntryTail>())
+                .unwrap();
+        assert_eq!(entry.inode, 42);
+        assert_eq!(entry.entry_len(), record_len);
+        assert_eq!(&entry.name[..name.len()], name);
+    }
+
+    #[test]
+    fn rejects_record_crossing_directory_payload_end() {
+        let mut block = vec![0u8; BLOCK_SIZE];
+        let data_end = BLOCK_SIZE - size_of::<Ext4DirEntryTail>();
+        let offset = data_end - EXT4_DIR_ENTRY_HEADER_SIZE;
+        block[offset + 4..offset + 6].copy_from_slice(&40u16.to_le_bytes());
+
+        assert!(Ext4DirEntry::from_slice_at(&block, offset, data_end).is_err());
+    }
+
+    #[test]
+    fn serializes_only_header_and_actual_name() {
+        let mut block = vec![0xa5u8; BLOCK_SIZE];
+        let mut entry = Ext4DirEntry::default();
+        entry
+            .write_entry(40, 7, "short", &DirEntryType::EXT4_DE_REG_FILE)
+            .unwrap();
+        entry.copy_to_slice(&mut block, 0xf04).unwrap();
+
+        assert_eq!(block[0xf04 + EXT4_DIR_ENTRY_HEADER_SIZE + 5], 0xa5);
     }
 }

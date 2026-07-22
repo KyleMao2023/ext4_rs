@@ -47,15 +47,16 @@ impl Ext4 {
                 result.blocks_scanned += 1;
 
                 // load physical block
-                let mut ext4block =
-                    Block::load(&self.block_device, fblock as usize * BLOCK_SIZE);
+                let mut ext4block = Block::load(&self.block_device, fblock as usize * BLOCK_SIZE);
 
                 // find entry in block
-                let r = self.dir_find_in_block(&ext4block, name, result);
-
-                if r.is_ok() {
-                    result.pblock_id = fblock as usize;
-                    return Ok(EOK);
+                match self.dir_find_in_block(&ext4block, name, result) {
+                    Ok(_) => {
+                        result.pblock_id = fblock as usize;
+                        return Ok(EOK);
+                    }
+                    Err(error) if error.error() != Errno::ENOENT => return Err(error),
+                    Err(_) => {}
                 }
             } else {
                 return_errno_with_message!(Errno::ENOENT, "dir search fail")
@@ -83,10 +84,11 @@ impl Ext4 {
     ) -> Result<Ext4DirEntry> {
         let mut offset = 0;
         let mut prev_de_offset = 0;
+        let data_end = BLOCK_SIZE - core::mem::size_of::<Ext4DirEntryTail>();
 
         // start from the first entry
-        while offset < BLOCK_SIZE - core::mem::size_of::<Ext4DirEntryTail>() {
-            let de: Ext4DirEntry = block.read_offset_as(offset);
+        while offset < data_end {
+            let de = Ext4DirEntry::from_slice_at(&block.data, offset, data_end)?;
             result.dirents_scanned += 1;
             if !de.unused() && de.compare_name(name) {
                 result.dentry = de;
@@ -136,13 +138,17 @@ impl Ext4 {
                 let fblock = path.pblock;
 
                 // load physical block
-                let ext4block =
-                    Block::load(&self.block_device, fblock as usize * BLOCK_SIZE);
+                let ext4block = Block::load(&self.block_device, fblock as usize * BLOCK_SIZE);
                 let mut offset = 0;
+                let data_end = BLOCK_SIZE - core::mem::size_of::<Ext4DirEntryTail>();
 
                 // iterate all entries in a block
-                while offset < BLOCK_SIZE - core::mem::size_of::<Ext4DirEntryTail>() {
-                    let de: Ext4DirEntry = ext4block.read_offset_as(offset);
+                while offset < data_end {
+                    let Ok(de) = Ext4DirEntry::from_slice_at(&ext4block.data, offset, data_end)
+                    else {
+                        warn!("Invalid ext4 directory entry at block {fblock}, offset {offset}");
+                        break;
+                    };
                     if !de.unused() {
                         entries.push(de);
                     }
@@ -186,7 +192,7 @@ impl Ext4 {
         let total_blocks: u64 = inode_size / block_size as u64;
 
         let inode_mode = child.inode.mode();
-        
+
         let de_type = if InodeFileType::from_bits_truncate(inode_mode) == InodeFileType::S_IFDIR {
             DirEntryType::EXT4_DE_DIR
         } else if InodeFileType::from_bits_truncate(inode_mode) == InodeFileType::S_IFLNK {
@@ -202,18 +208,14 @@ impl Ext4 {
             let pblock = self.get_pblock_idx(parent, iblock as u32)?;
 
             // load physical block
-            let mut ext4block =
-                Block::load(&self.block_device, pblock as usize * BLOCK_SIZE);
+            let mut ext4block = Block::load(&self.block_device, pblock as usize * BLOCK_SIZE);
 
-            let result = self.try_insert_to_existing_block(&mut ext4block, name, child.inode_num, &de_type);
+            let result =
+                self.try_insert_to_existing_block(&mut ext4block, name, child.inode_num, &de_type);
 
             if result.is_ok() {
                 // set checksum
-                self.dir_set_csum(
-                    &mut ext4block,
-                    parent.inode_num,
-                    parent.inode.generation(),
-                );
+                self.dir_set_csum(&mut ext4block, parent.inode_num, parent.inode.generation());
                 ext4block.sync_blk_to_disk(&self.block_device);
 
                 return Ok(EOK);
@@ -227,12 +229,11 @@ impl Ext4 {
         let new_block = self.append_inode_pblk(parent)?;
 
         // load new block
-        let mut new_ext4block =
-            Block::load(&self.block_device, new_block as usize * BLOCK_SIZE);
+        let mut new_ext4block = Block::load(&self.block_device, new_block as usize * BLOCK_SIZE);
 
         // write new entry to the new block
         // must succeed, as we just allocated the block
-        self.insert_to_new_block(&mut new_ext4block, child.inode_num, name, &de_type);
+        self.insert_to_new_block(&mut new_ext4block, child.inode_num, name, &de_type)?;
 
         // set checksum
         self.dir_set_csum(
@@ -261,21 +262,18 @@ impl Ext4 {
         child_inode: u32,
         de_type: &DirEntryType,
     ) -> Result<usize> {
+        if name.len() > 255 {
+            return_errno_with_message!(Errno::ENAMETOOLONG, "Directory entry name is too long");
+        }
         // required length aligned to 4 bytes
-        let required_len = {
-            let mut len = size_of::<Ext4DirEntry>() + name.len();
-            if len % 4 != 0 {
-                len += 4 - (len % 4);
-            }
-            len
-        };
+        let required_len = (EXT4_DIR_ENTRY_HEADER_SIZE + name.len() + 3) & !3;
 
         let mut offset = 0;
         let data_end = BLOCK_SIZE - size_of::<Ext4DirEntryTail>();
 
         // Start from the first entry
         while offset < data_end {
-            let mut de = Ext4DirEntry::try_from(&block.data[offset..]).unwrap();
+            let mut de = Ext4DirEntry::from_slice_at(&block.data, offset, data_end)?;
             let rec_len = de.entry_len as usize;
 
             // Every ext4 directory record must contain at least its fixed
@@ -286,9 +284,7 @@ impl Ext4 {
             let Some(next_offset) = offset.checked_add(rec_len) else {
                 return_errno_with_message!(Errno::EIO, "Invalid directory entry length");
             };
-            if rec_len < size_of::<Ext4FakeDirEntry>()
-                || rec_len % 4 != 0
-                || next_offset > data_end
+            if rec_len < size_of::<Ext4FakeDirEntry>() || rec_len % 4 != 0 || next_offset > data_end
             {
                 return_errno_with_message!(Errno::EIO, "Invalid directory entry length");
             }
@@ -301,8 +297,8 @@ impl Ext4 {
                 // `offset`, which compiled into a literal self-loop.
                 if rec_len >= required_len {
                     let mut new_entry = Ext4DirEntry::default();
-                    new_entry.write_entry(rec_len as u16, child_inode, name, de_type);
-                    new_entry.copy_to_slice(&mut block.data, offset);
+                    new_entry.write_entry(rec_len as u16, child_inode, name, de_type)?;
+                    new_entry.copy_to_slice(&mut block.data, offset)?;
                     block.sync_blk_to_disk(&self.block_device);
                     return Ok(EOK);
                 }
@@ -331,11 +327,11 @@ impl Ext4 {
 
                 // should not always be a directory
                 // let de_type = DirEntryType::EXT4_DE_DIR;
-                new_entry.write_entry(free_space as u16, child_inode, name, de_type);
+                new_entry.write_entry(free_space as u16, child_inode, name, de_type)?;
 
                 // update parent_de and new_de to blk_data
-                de.copy_to_slice(&mut block.data, offset);
-                new_entry.copy_to_slice(&mut block.data, offset + sz);
+                de.copy_to_slice(&mut block.data, offset)?;
+                new_entry.copy_to_slice(&mut block.data, offset + sz)?;
 
                 // Sync to disk
                 block.sync_blk_to_disk(&self.block_device);
@@ -362,18 +358,17 @@ impl Ext4 {
         inode: u32,
         name: &str,
         de_type: &DirEntryType,
-    ) {
+    ) -> Result<usize> {
         // write new entry
         let mut new_entry = Ext4DirEntry::default();
         let el = BLOCK_SIZE - size_of::<Ext4DirEntryTail>();
-        new_entry.write_entry(el as u16, inode, name, &de_type);
-        new_entry.copy_to_slice(&mut block.data, 0);
-
-        copy_dir_entry_to_array(&new_entry, &mut block.data, 0);
+        new_entry.write_entry(el as u16, inode, name, de_type)?;
+        new_entry.copy_to_slice(&mut block.data, 0)?;
 
         // init tail for new block
         let tail = Ext4DirEntryTail::new();
         tail.copy_to_slice(&mut block.data);
+        Ok(EOK)
     }
 
     pub fn dir_remove_entry(&self, parent: &mut Ext4InodeRef, path: &str) -> Result<usize> {
@@ -385,8 +380,7 @@ impl Ext4 {
         let mut ext4block = Block::load(&self.block_device, result.pblock_id * BLOCK_SIZE);
 
         // Invalidate entry first
-        let de_del: &mut Ext4DirEntry = ext4block.read_offset_as_mut(result.offset);
-        de_del.inode = 0;
+        Ext4DirEntry::set_inode_in_slice(&mut ext4block.data, result.offset, 0)?;
 
         // Store entry position in block
         let pos = result.offset;
@@ -394,31 +388,32 @@ impl Ext4 {
         // If entry is not the first in block, it must be merged with previous entry
         if pos != 0 {
             let mut offset = 0;
+            let data_end = BLOCK_SIZE - size_of::<Ext4DirEntryTail>();
 
             // Start from the first entry in block
-            let mut tmp_de: Ext4DirEntry = ext4block.read_offset_as(offset);
+            let mut tmp_de = Ext4DirEntry::from_slice_at(&ext4block.data, offset, data_end)?;
             let mut de_len = tmp_de.entry_len();
 
             // Find direct predecessor of removed entry
             while (offset + de_len as usize) < pos {
                 offset += de_len as usize;
-                tmp_de = ext4block.read_offset_as(offset);
+                tmp_de = Ext4DirEntry::from_slice_at(&ext4block.data, offset, data_end)?;
                 de_len = tmp_de.entry_len();
             }
-            
-            assert!(de_len as usize + offset == pos, "Invalid predecessor calculation");
+
+            if de_len as usize + offset != pos {
+                return_errno_with_message!(Errno::EIO, "Invalid predecessor calculation");
+            }
 
             // Add removed entry length to predecessor's length
             let del_len = result.dentry.entry_len();
-            let mut tmp_de_mut: &mut Ext4DirEntry = ext4block.read_offset_as_mut(offset);
-            tmp_de_mut.entry_len = de_len + del_len;
+            let Some(merged_len) = de_len.checked_add(del_len) else {
+                return_errno_with_message!(Errno::EIO, "Directory entry length overflow");
+            };
+            Ext4DirEntry::set_entry_len_in_slice(&mut ext4block.data, offset, merged_len)?;
         }
 
-        self.dir_set_csum(
-            &mut ext4block,
-            parent.inode_num,
-            parent.inode.generation(),
-        );
+        self.dir_set_csum(&mut ext4block, parent.inode_num, parent.inode.generation());
         ext4block.sync_blk_to_disk(&self.block_device);
 
         Ok(EOK)
@@ -450,19 +445,23 @@ impl Ext4 {
                 fblock = path.pblock;
 
                 // load physical block
-                let ext4block =
-                    Block::load(&self.block_device, fblock as usize * BLOCK_SIZE);
+                let ext4block = Block::load(&self.block_device, fblock as usize * BLOCK_SIZE);
 
                 // start from the first entry
                 let mut offset = 0;
-                while offset < BLOCK_SIZE - core::mem::size_of::<Ext4DirEntryTail>() {
-                    let de: Ext4DirEntry = ext4block.read_offset_as(offset);
+                let data_end = BLOCK_SIZE - core::mem::size_of::<Ext4DirEntryTail>();
+                while offset < data_end {
+                    let Ok(de) = Ext4DirEntry::from_slice_at(&ext4block.data, offset, data_end)
+                    else {
+                        warn!("Invalid ext4 directory entry at block {fblock}, offset {offset}");
+                        break;
+                    };
                     offset += de.entry_len as usize;
                     if de.inode == 0 {
                         continue;
                     }
                     // skip . and ..
-                    if de.get_name() == "." || de.get_name() == ".." {
+                    if de.compare_name(".") || de.compare_name("..") {
                         continue;
                     }
                     return true;
@@ -498,8 +497,7 @@ impl Ext4 {
         self.dir_find_entry(dir_inode, "..", &mut result)?;
 
         let mut ext4block = Block::load(&self.block_device, result.pblock_id * BLOCK_SIZE);
-        let dotdot: &mut Ext4DirEntry = ext4block.read_offset_as_mut(result.offset);
-        dotdot.inode = new_parent_inode;
+        Ext4DirEntry::set_inode_in_slice(&mut ext4block.data, result.offset, new_parent_inode)?;
         self.dir_set_csum(
             &mut ext4block,
             dir_ref.inode_num,
@@ -530,9 +528,7 @@ impl Ext4 {
 
         self.dir_remove_entry(parent, name)?;
         if target.inode.links_count() > 1 {
-            target
-                .inode
-                .set_links_count(target.inode.links_count() - 1);
+            target.inode.set_links_count(target.inode.links_count() - 1);
             self.write_back_inode(target);
         } else {
             self.truncate_inode(target, 0)?;
@@ -573,10 +569,16 @@ impl Ext4 {
 
             let mut target = self.get_inode_ref(target_entry.inode);
             if child.inode.is_dir() && !target.inode.is_dir() {
-                return_errno_with_message!(Errno::ENOTDIR, "cannot replace non-directory with directory");
+                return_errno_with_message!(
+                    Errno::ENOTDIR,
+                    "cannot replace non-directory with directory"
+                );
             }
             if !child.inode.is_dir() && target.inode.is_dir() {
-                return_errno_with_message!(Errno::EISDIR, "cannot replace directory with non-directory");
+                return_errno_with_message!(
+                    Errno::EISDIR,
+                    "cannot replace directory with non-directory"
+                );
             }
 
             if old_parent_inode == new_parent_inode {
@@ -636,14 +638,5 @@ impl Ext4 {
         self.write_back_inode(&mut new_parent);
 
         Ok(EOK)
-    }
-}
-
-pub fn copy_dir_entry_to_array(header: &Ext4DirEntry, array: &mut [u8], offset: usize) {
-    unsafe {
-        let de_ptr = header as *const Ext4DirEntry as *const u8;
-        let array_ptr = array as *mut [u8] as *mut u8;
-        let count = core::mem::size_of::<Ext4DirEntry>() / core::mem::size_of::<u8>();
-        core::ptr::copy_nonoverlapping(de_ptr, array_ptr.add(offset), count);
     }
 }
