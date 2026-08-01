@@ -334,6 +334,55 @@ impl Ext4 {
         self.read_at_with_mode(inode, offset, read_buf, true)
     }
 
+    /// Resolve a fully block-aligned file read without issuing data I/O.
+    ///
+    /// The returned tuple contains the number of readable bytes and one disk
+    /// offset for each filesystem block.  It owns no inode or extent-tree
+    /// references, so the caller may submit the data I/O after releasing its
+    /// outer filesystem metadata lock.
+    ///
+    /// Sparse ranges and reads ending in a partial filesystem block return
+    /// `Ok(None)` and should use the generic read path for now.
+    pub fn prepare_aligned_read_at(
+        &self,
+        inode: u32,
+        offset: usize,
+        requested_len: usize,
+    ) -> Result<Option<(usize, Vec<usize>)>> {
+        if requested_len == 0 {
+            return Ok(Some((0, Vec::new())));
+        }
+        if offset % BLOCK_SIZE != 0 || requested_len % BLOCK_SIZE != 0 {
+            return Ok(None);
+        }
+
+        let inode_ref = self.get_inode_ref(inode);
+        let file_size = inode_ref.inode.size() as usize;
+        if offset >= file_size {
+            return Ok(Some((0, Vec::new())));
+        }
+
+        let read_len = requested_len.min(file_size - offset);
+        if read_len % BLOCK_SIZE != 0 {
+            return Ok(None);
+        }
+
+        let block_count = read_len / BLOCK_SIZE;
+        let first_lblock = offset / BLOCK_SIZE;
+        let mut physical_offsets = Vec::with_capacity(block_count);
+        for logical_block in first_lblock..first_lblock + block_count {
+            match self.get_pblock_idx(&inode_ref, logical_block as u32) {
+                Ok(pblock_idx) => {
+                    physical_offsets.push(pblock_idx as usize * BLOCK_SIZE);
+                }
+                Err(error) if error.error() == Errno::ENOENT => return Ok(None),
+                Err(error) => return Err(error),
+            }
+        }
+
+        Ok(Some((read_len, physical_offsets)))
+    }
+
     fn read_at_with_mode(
         &self,
         inode: u32,
