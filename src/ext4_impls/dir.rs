@@ -4,6 +4,34 @@ use crate::return_errno_with_message;
 use crate::ext4_defs::*;
 
 impl Ext4 {
+    /// Return the end of the directory-entry payload for one logical block.
+    ///
+    /// Normal metadata-checksummed directory leaves reserve the final 12 bytes
+    /// for `Ext4DirEntryTail`. Htree root and internal index blocks do not use
+    /// that tail layout: their fake directory entry spans the complete block
+    /// and the hash index is overlaid inside it. Parsing an htree root with the
+    /// leaf limit makes the `..` record look truncated and aborts lookup before
+    /// any leaf block is searched.
+    pub(crate) fn dir_block_data_end(
+        &self,
+        indexed: bool,
+        logical_block: usize,
+        data: &[u8],
+    ) -> usize {
+        let internal_index = indexed
+            && logical_block != 0
+            && data.len() >= EXT4_DIR_ENTRY_HEADER_SIZE
+            && u32::from_le_bytes(data[0..4].try_into().unwrap()) == 0
+            && usize::from(u16::from_le_bytes(data[4..6].try_into().unwrap())) == BLOCK_SIZE;
+        if indexed && (logical_block == 0 || internal_index) {
+            BLOCK_SIZE
+        } else if self.super_block.features_read_only & EXT4_FEATURE_RO_COMPAT_METADATA_CSUM != 0 {
+            BLOCK_SIZE - core::mem::size_of::<Ext4DirEntryTail>()
+        } else {
+            BLOCK_SIZE
+        }
+    }
+
     /// Find a directory entry in a directory
     ///
     /// Params:
@@ -50,7 +78,12 @@ impl Ext4 {
                 let mut ext4block = Block::load(&self.block_device, fblock as usize * BLOCK_SIZE);
 
                 // find entry in block
-                match self.dir_find_in_block(&ext4block, name, result) {
+                let data_end = self.dir_block_data_end(
+                    parent.inode.flags() & EXT4_INODE_FLAG_INDEX != 0,
+                    iblock as usize,
+                    &ext4block.data,
+                );
+                match self.dir_find_in_block_until(&ext4block, name, result, data_end) {
                     Ok(_) => {
                         result.pblock_id = fblock as usize;
                         return Ok(EOK);
@@ -82,9 +115,23 @@ impl Ext4 {
         name: &str,
         result: &mut Ext4DirSearchResult,
     ) -> Result<Ext4DirEntry> {
+        self.dir_find_in_block_until(
+            block,
+            name,
+            result,
+            BLOCK_SIZE - core::mem::size_of::<Ext4DirEntryTail>(),
+        )
+    }
+
+    fn dir_find_in_block_until(
+        &self,
+        block: &Block,
+        name: &str,
+        result: &mut Ext4DirSearchResult,
+        data_end: usize,
+    ) -> Result<Ext4DirEntry> {
         let mut offset = 0;
         let mut prev_de_offset = 0;
-        let data_end = BLOCK_SIZE - core::mem::size_of::<Ext4DirEntryTail>();
 
         // start from the first entry
         while offset < data_end {
@@ -140,7 +187,11 @@ impl Ext4 {
                 // load physical block
                 let ext4block = Block::load(&self.block_device, fblock as usize * BLOCK_SIZE);
                 let mut offset = 0;
-                let data_end = BLOCK_SIZE - core::mem::size_of::<Ext4DirEntryTail>();
+                let data_end = self.dir_block_data_end(
+                    inode_ref.inode.flags() & EXT4_INODE_FLAG_INDEX != 0,
+                    iblock as usize,
+                    &ext4block.data,
+                );
 
                 // iterate all entries in a block
                 while offset < data_end {

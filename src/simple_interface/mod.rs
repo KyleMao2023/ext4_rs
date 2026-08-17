@@ -156,7 +156,6 @@ impl Ext4 {
         }
 
         let total_blocks = inode_size.div_ceil(BLOCK_SIZE);
-        let tail_size = core::mem::size_of::<Ext4DirEntryTail>();
         let mut written = 0usize;
         let mut iblock = offset / BLOCK_SIZE;
         let mut entry_off = offset % BLOCK_SIZE;
@@ -169,21 +168,25 @@ impl Ext4 {
             let pblock = path.path.last().unwrap().pblock;
             let ext4block = Block::load(&self.block_device, pblock as usize * BLOCK_SIZE);
             let block_base = iblock * BLOCK_SIZE;
+            let data_end = self.dir_block_data_end(
+                inode_ref.inode.flags() & EXT4_INODE_FLAG_INDEX != 0,
+                iblock,
+                &ext4block.data,
+            );
 
-            if entry_off >= BLOCK_SIZE.saturating_sub(tail_size) {
+            if entry_off >= data_end {
                 iblock += 1;
                 entry_off = 0;
                 continue;
             }
 
-            while entry_off < BLOCK_SIZE - tail_size {
+            while entry_off < data_end {
                 let stream_pos = block_base + entry_off;
                 if stream_pos >= inode_size {
                     return written;
                 }
 
-                let Ok(de) =
-                    Ext4DirEntry::from_slice_at(&ext4block.data, entry_off, BLOCK_SIZE - tail_size)
+                let Ok(de) = Ext4DirEntry::from_slice_at(&ext4block.data, entry_off, data_end)
                 else {
                     return written;
                 };
